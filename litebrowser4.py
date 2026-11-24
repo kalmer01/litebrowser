@@ -19,6 +19,7 @@ def _mark(name):
 
 
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -77,7 +78,7 @@ DATA = Path(os.environ.get("LITEBROWSER_DATA") or (Path.home() / ".litebrowser")
 _mark("imports_done")
 
 # ---------------------------------------------------------------- self-update (single file)
-APP_VERSION = "4.2.0"          # bump this whenever you publish a new litebrowser4.py
+APP_VERSION = "4.3.0"          # bump this whenever you publish a new litebrowser4.py
 UPDATE_URL = ""                # direct link to the raw litebrowser4.py (e.g. a GitHub "Raw" link); or set it in the menu
 UPDATE_FILE = DATA / "litebrowser_update.py"   # used by the .exe build, which can't overwrite itself
 
@@ -665,6 +666,8 @@ class CookieJar(QObject):
         self.store = store
         self.jar = {}                  # (domain, path, name) -> (value, raw "Set-Cookie" text)
         self._restoring = False
+        self.forget = set()            # sites whose sign-in is thrown away when the browser closes
+        self._purge_until = 0.0
         self._dirty = False
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
@@ -677,6 +680,26 @@ class CookieJar(QObject):
     @staticmethod
     def _key(c):
         return (str(c.domain()).lower(), str(c.path()), bytes(c.name()).decode("utf-8", "ignore"))
+
+    def _forgotten(self, domain):
+        d = str(domain).lower().lstrip(".")
+        return any(d == f or d.endswith("." + f) for f in self.forget)
+
+    def forget_now(self):
+        """Delete every saved cookie of the 'forget on exit' sites, from the jar and from the engine."""
+        n = 0
+        for key in [k for k in self.jar if self._forgotten(k[0])]:
+            try:
+                cs = QNetworkCookie.parseCookies(self.jar[key][1].encode("utf-8"))
+                if cs:
+                    self.store.deleteCookie(cs[0])
+            except Exception:
+                pass
+            self.jar.pop(key, None)
+            n += 1
+        if n:
+            self._dirty = True
+        return n
 
     def _load_file(self):
         data = {}
@@ -700,6 +723,9 @@ class CookieJar(QObject):
         """Hand every saved cookie back to the engine (call before the first page loads)."""
         self._restoring = True
         n = 0
+        self._purge_until = time.time() + 8
+        for key in [k for k in self.jar if self._forgotten(k[0])]:
+            self.jar.pop(key, None)                    # never put these back
         try:
             for (d, p, name), (v, raw, exp) in list(self.jar.items()):
                 try:
@@ -708,6 +734,8 @@ class CookieJar(QObject):
                         continue
                     c = cs[0]
                     c.setExpirationDate(QDateTime.fromSecsSinceEpoch(int(exp)))
+                    if not d.startswith("."):
+                        c.setDomain("")                # a host-only cookie (e.g. __Host-GAPS) must stay host-only, or Chromium refuses it
                     host = d.lstrip(".")
                     self.store.setCookie(c, QUrl(("https://" if c.isSecure() else "http://") + host + (p or "/")))
                     n += 1
@@ -724,6 +752,9 @@ class CookieJar(QObject):
     def on_added(self, cookie):
         try:
             c = QNetworkCookie(cookie)
+            if self.forget and time.time() < self._purge_until and self._forgotten(c.domain()):
+                self.store.deleteCookie(c)             # left over in Chromium's own database from the last run
+                return
             exp = time.time() + self.SESSION_DAYS * 86400
             if not c.isSessionCookie():
                 exp = c.expirationDate().toSecsSinceEpoch()
@@ -969,6 +1000,72 @@ DANGEROUS_EXT = {".exe", ".msi", ".bat", ".cmd", ".com", ".scr", ".ps1", ".vbs",
 _RESERVED = {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
 
 
+UPDATE_PUBKEY = ""      # RSA public key (hex) of YOUR update-signing key. Set it by running sign_update.bat once; "" = unsigned updates are accepted
+_SHA256_DIGESTINFO = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def rsa_emsa(digest, k):
+    return b"\x00\x01" + b"\xff" * (k - len(_SHA256_DIGESTINFO) - len(digest) - 3) + b"\x00" + _SHA256_DIGESTINFO + digest
+
+
+def rsa_verify(data, sig_hex, n_hex, e=65537):
+    """Check an RSA PKCS#1 v1.5 / SHA-256 signature. Pure Python, no packages. Line endings are ignored (git may change them)."""
+    try:
+        n = int(n_hex, 16)
+        k = (n.bit_length() + 7) // 8
+        sig = int(str(sig_hex).strip(), 16)
+        if not 0 < sig < n:
+            return False
+        em = pow(sig, e, n).to_bytes(k, "big")
+        return hmac.compare_digest(em, rsa_emsa(hashlib.sha256(data.replace(b"\r\n", b"\n")).digest(), k))
+    except Exception:
+        return False
+
+
+def pw_hash(password, salt=None):
+    salt = salt or os.urandom(16)
+    return salt.hex() + ":" + hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 400000).hex()
+
+
+def pw_check(password, stored):
+    try:
+        salt, h = stored.split(":")
+        return hmac.compare_digest(pw_hash(password, bytes.fromhex(salt)).split(":")[1], h)
+    except Exception:
+        return False
+
+
+def _xor(a, b):
+    return (int.from_bytes(a, "big") ^ int.from_bytes(b, "big")).to_bytes(len(a), "big") if a else b""
+
+
+def _keystream(key, nonce, n):
+    out, c = bytearray(), 0
+    while len(out) < n:
+        out += hmac.new(key, nonce + c.to_bytes(8, "big"), hashlib.sha256).digest()
+        c += 1
+    return bytes(out[:n])
+
+
+def seal_with_passphrase(data, passphrase):
+    """Backup encryption from standard parts: PBKDF2-SHA256 key, HMAC-SHA256 counter keystream, HMAC-SHA256 tag (encrypt-then-MAC)."""
+    salt, nonce = os.urandom(16), os.urandom(16)
+    k = hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, 300000, 64)
+    ct = _xor(data, _keystream(k[:32], nonce, len(data)))
+    tag = hmac.new(k[32:], b"LBK1" + salt + nonce + ct, hashlib.sha256).digest()
+    return b"LBK1" + salt + nonce + tag + ct
+
+
+def open_with_passphrase(blob, passphrase):
+    if blob[:4] != b"LBK1" or len(blob) < 68:
+        raise ValueError("this is not a LiteBrowser backup")
+    salt, nonce, tag, ct = blob[4:20], blob[20:36], blob[36:68], blob[68:]
+    k = hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, 300000, 64)
+    if not hmac.compare_digest(tag, hmac.new(k[32:], b"LBK1" + salt + nonce + ct, hashlib.sha256).digest()):
+        raise ValueError("wrong passphrase, or the file is damaged")
+    return _xor(ct, _keystream(k[:32], nonce, len(ct)))
+
+
 def safe_filename(name):
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or "")).strip(" .") or "download"
     if name.split(".")[0].lower() in _RESERVED:
@@ -1109,7 +1206,7 @@ class Guard:
         """Cheap check used for every sub-resource: hosts known to serve malware."""
         return bool(self.mal_hosts) and any(h in self.mal_hosts for h in self._parents(host))
 
-    def verdict(self, url):
+    def verdict(self, url, ignore_allowed=False):
         """None if fine, else (level, title, why) with level 'block' (known bad) or 'warn' (looks suspicious)."""
         from urllib.parse import urlsplit
         try:
@@ -1119,7 +1216,7 @@ class Guard:
             return None
         if u.scheme not in ("http", "https") or not host or _is_private_host(host):
             return None
-        if any(h in self.allowed for h in self._parents(host)):
+        if not ignore_allowed and any(h in self.allowed for h in self._parents(host)):
             return None
         if self.bad_host(host):
             return ("block", "Dangerous site", "This address is on a list of sites that spread malware.")
@@ -1202,6 +1299,7 @@ class OsVerify(QObject):
 class EngineCheck(QObject):
     """Is a newer PyQt6-WebEngine (= newer Chromium with security fixes) on PyPI?"""
     result = pyqtSignal(str, str)          # installed, latest ("" if unknown)
+    age_days = -1                          # age of the installed engine in days (-1 = unknown)
 
     @staticmethod
     def newer(a, b):
@@ -1223,6 +1321,11 @@ class EngineCheck(QObject):
             try:
                 data = json.loads(urlopen(Request("https://pypi.org/pypi/PyQt6-WebEngine/json",
                                                   headers={"User-Agent": "LiteBrowser"}), timeout=20).read())
+                try:        # how old is the installed engine? (upload date of the installed wheel)
+                    up = data["releases"][cur][0]["upload_time_iso_8601"]
+                    self.age_days = max(0, int((time.time() - datetime.fromisoformat(up.replace("Z", "+00:00")).timestamp()) / 86400))
+                except Exception:
+                    pass
                 self.result.emit(cur, str(data["info"]["version"]))
             except Exception:
                 self.result.emit(cur, "")
@@ -1250,6 +1353,10 @@ class SelfUpdater(QObject):
                 if not url.lower().startswith("https://"):
                     raise ValueError("the update link must start with https://")
                 data = urlopen(Request(url, headers={"User-Agent": "LiteBrowser"}), timeout=25).read(8_000_000)
+                if UPDATE_PUBKEY:
+                    sig = urlopen(Request(url + ".sig", headers={"User-Agent": "LiteBrowser"}), timeout=25).read(4000).decode("ascii", "ignore")
+                    if not rsa_verify(data, sig, UPDATE_PUBKEY):
+                        raise ValueError("the update is not signed with your key - not installed")
                 text = data.decode("utf-8")
                 new = _ver(text)
                 if not new:
@@ -3882,6 +3989,7 @@ class Browser(QMainWindow):
             pass
         self.profile.downloadRequested.connect(self.on_download)
         self.cookies = CookieJar(self.profile.cookieStore(), self)      # our own copy of all cookies (keeps you signed in)
+        self.cookies.forget = {str(x).lower() for x in load_json(PREFS_FILE, {}).get("forget_on_exit", []) if x}
         self.cookies.restore()
         self._notifs = []
         self._tray = None
@@ -3898,6 +4006,7 @@ class Browser(QMainWindow):
         self.osv = OsVerify()
         self.osv.result.connect(self._on_verified)
         self._verified_at = 0.0
+        self._mp_fail, self._mp_until = 0, 0.0
         self._verify_then = None
         self.pw = PasswordStore()
         self.pw_on = load_json(PREFS_FILE, {}).get("pw_offer", True)
@@ -5261,6 +5370,8 @@ class Browser(QMainWindow):
         if latest and cur and EngineCheck.newer(cur, latest):
             self._engine_new = latest
             self.toast(f"A newer browser engine ({latest}) has security fixes - menu > Update engine")
+        elif self.engine.age_days > 60:
+            self.toast(f"Your browser engine is {self.engine.age_days} days old - check menu > Update engine")
 
     def chromium_version(self):
         try:
@@ -5346,6 +5457,8 @@ class Browser(QMainWindow):
         host = u.host()
         if u.scheme() != "https" and host not in ("localhost", "127.0.0.1"):
             return                                     # never fill a password into an unencrypted page
+        if self.guard.verdict(u.toString(), True):
+            return                                     # never fill a password into a page that looks fake or is on a bad-site list
         found = self.pw.find(host)
         if not found:
             return
@@ -5359,6 +5472,144 @@ class Browser(QMainWindow):
                 v.page().runJavaScript(code, self.PW_WORLD)
         except RuntimeError:
             pass
+
+    def toggle_forget_site(self):
+        cv = self.cur()
+        host = cv.url().host() if cv is not None else ""
+        if not host or _is_private_host(host):
+            return
+        dom = reg_domain(host.lower())
+        prefs = load_json(PREFS_FILE, {})
+        lst = {str(x).lower() for x in prefs.get("forget_on_exit", [])}
+        if dom in lst:
+            lst.discard(dom)
+            self.cookies.forget.discard(dom)
+            self.toast(f"{dom}: sign-in is kept again")
+        else:
+            lst.add(dom)
+            self.cookies.forget.add(dom)
+            self.toast(f"{dom}: you will be signed out when the browser closes")
+        prefs["forget_on_exit"] = sorted(lst)
+        save_json(PREFS_FILE, prefs)
+
+    def show_permissions(self):
+        from PyQt6.QtWidgets import QDialog, QListWidget, QPushButton
+        try:
+            perms = list(self.profile.listAllPermissions())
+        except Exception:
+            perms = []
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Site permissions")
+        dlg.resize(560, 420)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Sites that you allowed or blocked. Select one and revoke it to be asked again."))
+        lst = QListWidget()
+        lay.addWidget(lst)
+
+        def nm(x):
+            return str(x).split(".")[-1]
+        for pm in perms:
+            try:
+                lst.addItem(f"{pm.origin().host() or pm.origin().toString()}   -   {nm(pm.permissionType())}   -   {nm(pm.state())}")
+            except Exception:
+                lst.addItem("(unreadable entry)")
+        if not perms:
+            lst.addItem("No saved site permissions")
+        row = QHBoxLayout()
+        b1, b2, b3 = QPushButton("Revoke selected"), QPushButton("Revoke all"), QPushButton("Close")
+        for b in (b1, b2, b3):
+            row.addWidget(b)
+        lay.addLayout(row)
+
+        def revoke(idx):
+            if 0 <= idx < len(perms):
+                try:
+                    perms[idx].reset()
+                except Exception:
+                    pass
+
+        def one():
+            i = lst.currentRow()
+            if 0 <= i < len(perms):
+                revoke(i)
+                lst.takeItem(i)
+                perms.pop(i)
+        b1.clicked.connect(one)
+
+        def allr():
+            for i in range(len(perms)):
+                revoke(i)
+            perms.clear()
+            lst.clear()
+            lst.addItem("No saved site permissions")
+        b2.clicked.connect(allr)
+        b3.clicked.connect(dlg.accept)
+        dlg.exec()
+
+    def backup_data(self):
+        self.verify_user(self._backup_go)
+
+    def _backup_go(self):
+        a, ok = QInputDialog.getText(self, "Back up", "Choose a passphrase for the backup (at least 10 characters).\nWithout it the backup cannot be opened:",
+                                     QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+        if len(a) < 10:
+            QMessageBox.warning(self, "Back up", "Use at least 10 characters.")
+            return
+        b, ok = QInputDialog.getText(self, "Back up", "Type the passphrase again:", QLineEdit.EchoMode.Password)
+        if not ok or a != b:
+            QMessageBox.warning(self, "Back up", "The two entries did not match.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save backup", f"litebrowser-backup-{datetime.now():%Y%m%d}.lbk", "LiteBrowser backup (*.lbk)")
+        if not path:
+            return
+        try:
+            self.cookies.save()
+            blob = seal_with_passphrase(json.dumps({"v": 1, "prefs": load_json(PREFS_FILE, {}), "bookmarks": self.bm,
+                                                    "passwords": self.pw.items, "never": sorted(self.pw.never)}).encode("utf-8"), a)
+            Path(path).write_bytes(blob)
+            self.toast("Backup saved (encrypted with your passphrase)")
+        except Exception as ex:
+            QMessageBox.warning(self, "Back up", "Backup failed: " + str(ex)[:120])
+
+    def restore_backup(self):
+        self.verify_user(self._restore_go)
+
+    def _restore_go(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open backup", "", "LiteBrowser backup (*.lbk)")
+        if not path:
+            return
+        pw, ok = QInputDialog.getText(self, "Restore", "Passphrase of this backup:", QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+        try:
+            d = json.loads(open_with_passphrase(Path(path).read_bytes(), pw).decode("utf-8"))
+        except Exception as ex:
+            QMessageBox.warning(self, "Restore", str(ex)[:120])
+            return
+        if QMessageBox.question(self, "Restore", "Add the saved passwords, replace bookmarks and merge settings from this backup?"
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+        n = 0
+        for x in d.get("passwords", []):
+            try:
+                if self.pw.status(x["host"], x["user"], x["pw"]) != "same":
+                    self.pw.save(x["host"], x["user"], x["pw"])
+                    n += 1
+            except Exception:
+                continue
+        for h in d.get("never", []):
+            self.pw.never.add(h)
+        self.pw.save_file()
+        if isinstance(d.get("bookmarks"), dict):
+            self.bm = {"show": bool(d["bookmarks"].get("show", True)), "items": clean_bm(d["bookmarks"].get("items", []))}
+            self.save_bm()
+            self.refresh_bookmarks()
+        prefs = load_json(PREFS_FILE, {})
+        prefs.update(d.get("prefs", {}) if isinstance(d.get("prefs"), dict) else {})
+        save_json(PREFS_FILE, prefs)
+        self.toast(f"Restored ({n} passwords added). Restart to apply settings.")
 
     def toggle_https_first(self):
         self.guard.https_first = not self.guard.https_first
@@ -5399,6 +5650,10 @@ class Browser(QMainWindow):
         add("Notifications tray", QSystemTrayIcon.isSystemTrayAvailable())
         add("Update link is https", (not SelfUpdater.url()) or SelfUpdater.url().lower().startswith("https://"),
             SelfUpdater.url() or "no auto-update link set")
+        add("Signed updates", bool(UPDATE_PUBKEY) or not SelfUpdater.url(),
+            "updates must carry your signature" if UPDATE_PUBKEY else "no signing key set - run sign_update.bat once")
+        add("Password protection", True,
+            "Windows Hello, else master password" + (" (set)" if load_json(PREFS_FILE, {}).get("pw_master") else " (not set yet)"))
         add("Engine version", self.chromium_version() != "?", "Chromium " + self.chromium_version())
         return out
 
@@ -5438,10 +5693,61 @@ class Browser(QMainWindow):
             self._verified_at = time.time()
             then()
         elif res in ("DeviceNotPresent", "NotConfiguredForUser", "DisabledByPolicy", "Unavailable"):
-            self.toast("Windows Hello is not set up, so your passwords are open to anyone using this PC. Set it up in Windows Settings > Accounts > Sign-in options.")
-            then()
+            self._master_gate(then)                    # no Windows Hello here: use the master password instead
         else:
             self.toast("Not confirmed - passwords stay locked")
+
+    def set_master_password(self):
+        prefs = load_json(PREFS_FILE, {})
+        old = prefs.get("pw_master", "")
+        if old:
+            cur, ok = QInputDialog.getText(self, "Master password", "Current master password:", QLineEdit.EchoMode.Password)
+            if not ok or not pw_check(cur, old):
+                self.toast("Master password not changed")
+                return False
+        a, ok = QInputDialog.getText(self, "Master password", "New master password (at least 8 characters):", QLineEdit.EchoMode.Password)
+        if not ok:
+            return False
+        if len(a) < 8:
+            QMessageBox.warning(self, "Master password", "Use at least 8 characters.")
+            return False
+        b, ok = QInputDialog.getText(self, "Master password", "Type it again:", QLineEdit.EchoMode.Password)
+        if not ok or a != b:
+            QMessageBox.warning(self, "Master password", "The two entries did not match. Nothing was changed.")
+            return False
+        prefs["pw_master"] = pw_hash(a)
+        save_json(PREFS_FILE, prefs)
+        self.toast("Master password saved")
+        return True
+
+    def _master_gate(self, then):
+        """Used when Windows Hello is not available: ask for the master password (5 wrong tries = 1 minute pause)."""
+        if time.time() < self._mp_until:
+            self.toast("Too many wrong tries - wait a minute")
+            return
+        stored = load_json(PREFS_FILE, {}).get("pw_master", "")
+        if not stored:
+            if QMessageBox.question(self, "Protect your passwords",
+                                    "Windows Hello is not set up on this PC, so nothing would stop someone at your keyboard from reading "
+                                    "your saved passwords.\n\nSet a master password for the Passwords window now?"
+                                    ) == QMessageBox.StandardButton.Yes and self.set_master_password():
+                self._verified_at = time.time()
+                then()
+            else:
+                self.toast("Passwords stay locked")
+            return
+        pw, ok = QInputDialog.getText(self, "Passwords", "Master password:", QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+        if pw_check(pw, stored):
+            self._mp_fail = 0
+            self._verified_at = time.time()
+            then()
+        else:
+            self._mp_fail += 1
+            if self._mp_fail >= 5:
+                self._mp_fail, self._mp_until = 0, time.time() + 60
+            self.toast("Wrong master password")
 
     def show_passwords(self):
         try:
@@ -5469,6 +5775,8 @@ class Browser(QMainWindow):
     def shutdown_web(self):
         """Tear the web engine down in the right order so Chromium writes cookies/logins to disk before we exit."""
         try:
+            if self.cookies.forget_now():
+                QApplication.processEvents()
             self.cookies.save()
         except Exception:
             pass
@@ -5626,9 +5934,18 @@ class Browser(QMainWindow):
             m.addAction(f"Restart now  (v{self._update_ready} is ready)", self.restart_now)
         m.addAction(f"Check for browser updates  (v{APP_VERSION})", lambda: self.check_updates(True))
         m.addAction("Auto-update source...", self.set_update_source)
+        age = self.engine.age_days
         m.addAction(f"Update browser engine  (Chromium {self.chromium_version()}"
-                    + (f", {self._engine_new} available)" if self._engine_new else ")"), self.update_engine)
+                    + (f", {self._engine_new} available" if self._engine_new else "")
+                    + (f", {age} days old - update!" if age > 60 else "") + ")", self.update_engine)
         m.addAction("Reset blocking stats", self.reset_stats)
+        cvf = self.cur()
+        hf0 = cvf.url().host() if cvf is not None else ""
+        if hf0 and not _is_private_host(hf0):
+            dom0 = reg_domain(hf0.lower())
+            fa = QAction(f"Sign me out of {dom0} when I close the browser", m, checkable=True, checked=dom0 in self.cookies.forget)
+            fa.triggered.connect(self.toggle_forget_site)
+            m.addAction(fa)
         cv0 = self.cur()
         h0 = self._site_key(cv0.url().host()) if cv0 is not None else ""
         if h0:
@@ -5647,7 +5964,11 @@ class Browser(QMainWindow):
         else:
             m.addAction("Make default browser", self.make_default)
         m.addAction("Developer tools (F12)", self.show_devtools)
+        m.addAction("Site permissions...", self.show_permissions)
         m.addAction("Reset site permissions", self.reset_permissions)
+        m.addAction("Master password for passwords...", self.set_master_password)
+        m.addAction("Back up bookmarks, passwords and settings...", self.backup_data)
+        m.addAction("Restore from backup...", self.restore_backup)
         m.addAction("Clear cache and cookies", self.clear_data)
         return m
 
