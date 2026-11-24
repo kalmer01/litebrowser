@@ -64,7 +64,7 @@ DATA = Path(os.environ.get("LITEBROWSER_DATA") or (Path.home() / ".litebrowser")
 _mark("imports_done")
 
 # ---------------------------------------------------------------- self-update (single file)
-APP_VERSION = "4.0.2"          # bump this whenever you publish a new litebrowser4.py
+APP_VERSION = "4.0.3"          # bump this whenever you publish a new litebrowser4.py
 UPDATE_URL = ""                # direct link to the raw litebrowser4.py (e.g. a GitHub "Raw" link); or set it in the menu
 UPDATE_FILE = DATA / "litebrowser_update.py"   # used by the .exe build, which can't overwrite itself
 
@@ -2448,6 +2448,15 @@ class DevTools(QWidget):
         super().closeEvent(e)
 
 
+class CloseSlot(QWidget):
+    """Invisible stand-in for Qt's close button: keeps the tab text clear of the X we paint ourselves."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(20, 20)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+
 class TabStub:
     """A restored tab whose web view has not been created yet: it remembers URL, title, icon colour."""
 
@@ -2491,6 +2500,19 @@ class TabBar(QTabBar):
         self.customContextMenuRequested.connect(lambda pos: self.win.tab_menu(self.tabAt(pos), self.mapToGlobal(pos)))
         self.currentChanged.connect(lambda _i: (self.refit(True), self._ease_start()))
         self._lv = {}                                  # per-tab highlight level 0..1, eased towards its target
+        self._cv = {}                                  # per-tab close-button hover level 0..1
+        self._ch = -1                                  # tab whose close button the mouse is over
+        self._pc = None                                # tab whose close button is being pressed
+        self._hold = False                             # after a mouse close keep widths so the next X lands under the cursor
+        self._closing = None                           # tab currently shrinking away
+        self._close_t = 0.0
+        self._canim = QVariantAnimation(self)
+        self._canim.setDuration(150)
+        self._canim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._canim.setStartValue(0.0)
+        self._canim.setEndValue(1.0)
+        self._canim.valueChanged.connect(self._close_step)
+        self._canim.finished.connect(self._finish_close)
         self._lv_timer = QTimer(self)
         self._lv_timer.setInterval(16)
         self._lv_timer.timeout.connect(self._ease_step)
@@ -2510,6 +2532,8 @@ class TabBar(QTabBar):
         else:
             h = self._th
         w = self._w_cur if index == self.currentIndex() else self._w_other
+        if self._closing is not None and self.tabData(index) is self._closing:
+            w = max(1.0, w * (1.0 - self._close_t))
         return QSize(int(round(w)), h)
 
     def minimumTabSizeHint(self, index):
@@ -2530,6 +2554,11 @@ class TabBar(QTabBar):
 
     def _do_refit(self):
         self._pending = False
+        for i in range(self.count()):                    # swap Qt's close buttons for invisible spacers (we paint the X)
+            b = self.tabButton(i, QTabBar.ButtonPosition.RightSide)
+            if b is not None and not isinstance(b, CloseSlot):
+                self.setTabButton(i, QTabBar.ButtonPosition.RightSide, CloseSlot())
+        self._apply_close()
         self.refit(True)
 
     def refit(self, animate=True):
@@ -2544,6 +2573,8 @@ class TabBar(QTabBar):
         else:
             cur = float(self.ACTIVE_MIN)
             other = float(max(self.MIN_W, (avail - self.ACTIVE_MIN) // max(1, n - 1)))
+        if self._hold and self._inited:                  # Brave-style: don't re-grow tabs while you keep closing them
+            cur, other = min(cur, self._tgt[0]), min(other, self._tgt[1])
         new = (cur, other, avail)
         cur_dep = other < 92 or cur != other     # the active tab only matters when widths/close buttons differ
         sig = (n, self.currentIndex() if cur_dep else -1, cur >= 56, other >= 56, cur >= 92, other >= 92)
@@ -2604,6 +2635,60 @@ class TabBar(QTabBar):
             w = self._tgt[0] if i == cur else self._tgt[1]
             btn.setVisible(w >= 92 or (w >= 56 and (i == cur or i == self._hover)))
 
+    # ---- close button (painted by us) ------------------------------------------------------
+    def _close_vis(self, i):
+        if i < 0 or i >= self.count():
+            return False
+        w = self._tgt[0] if i == self.currentIndex() else self._tgt[1]
+        return w >= 92 or (w >= 56 and (i == self.currentIndex() or i == self._hover))
+
+    def _cr(self, i):
+        r = QRectF(self.tabRect(i)).adjusted(2, 3, -2, -3)
+        return QRectF(r.right() - 27, r.center().y() - 11, 22, 22)
+
+    def _poke(self):
+        if self.count():
+            self.setTabText(0, self.tabText(0))          # make Qt re-run its tab layout
+        self.update()
+
+    def _index_of(self, d):
+        for i in range(self.count()):
+            if self.tabData(i) is d:
+                return i
+        return -1
+
+    def close_animated(self, i):
+        d = self.tabData(i)
+        if d is None:
+            return
+        if self._closing is not None:
+            if self._closing is d:
+                return
+            self._canim.stop()
+            self._finish_close()                         # a previous close is still running: finish it now
+        i = self._index_of(d)
+        if i < 0:
+            return
+        if self.count() <= 1 or not self.isVisible():
+            self.win.close_tab(i)
+            return
+        self._closing = d
+        self._close_t = 0.0
+        self._canim.start()
+
+    def _close_step(self, t):
+        self._close_t = float(t)
+        self._poke()
+
+    def _finish_close(self):
+        d, self._closing = self._closing, None
+        self._close_t = 0.0
+        if d is None:
+            return
+        i = self._index_of(d)
+        if i >= 0:
+            self.win.close_tab(i)
+
     # ---- eased highlight ----------------------------------------------------------------
     def _target(self, i):
         return 1.0 if i == self.currentIndex() else (0.4 if i == self._hover else 0.0)
@@ -2626,8 +2711,17 @@ class TabBar(QTabBar):
             else:
                 v = t
             self._lv[k] = v
+            ct = 1.0 if i == self._ch else 0.0
+            cv = self._cv.get(k, 0.0)
+            if abs(ct - cv) > 0.01:
+                cv += (ct - cv) * 0.35
+                busy = True
+            else:
+                cv = ct
+            self._cv[k] = cv
         for k in [k for k in self._lv if k not in keep]:
             del self._lv[k]
+            self._cv.pop(k, None)
         self.update()
         if not busy:
             self._lv_timer.stop()
@@ -2643,6 +2737,8 @@ class TabBar(QTabBar):
                 r.moveLeft(max(2.0, min(self._mx - self._grab + 2, self.width() - r.width() - 2.0)))
             tint = getattr(self.tabData(i), "tint", None) or QColor(255, 96, 118)
             sel = i == cur
+            closing = self._closing is not None and self.tabData(i) is self._closing
+            p.setOpacity(max(0.0, 1.0 - self._close_t * 1.15) if closing else 1.0)
             lv = self._lv.get(id(self.tabData(i)), 1.0 if sel else 0.0)
             if lv > 0.02:
                 g = QLinearGradient(r.left(), r.top(), r.right(), r.bottom())
@@ -2665,6 +2761,20 @@ class TabBar(QTabBar):
                 p.setBrush(c)
                 p.setPen(Qt.PenStyle.NoPen)
                 p.drawRoundedRect(QRectF(r.center().x() - 7, r.bottom() - 1.5, 14, 2), 1, 1)
+            if self._close_vis(i) and not closing:
+                cr = QRectF(r.right() - 27, r.center().y() - 11, 22, 22)
+                cv = self._cv.get(id(self.tabData(i)), 0.0)
+                if cv > 0.02:
+                    p.setBrush(QColor(255, 255, 255, int((60 if self._pc == i else 42) * cv)))
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.drawEllipse(cr)
+                pen = QPen(QColor(255, 235, 238, int(150 + 100 * cv)), 1.6)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                p.setPen(pen)
+                c = cr.center()
+                k = 3.6
+                p.drawLine(QPointF(c.x() - k, c.y() - k), QPointF(c.x() + k, c.y() + k))
+                p.drawLine(QPointF(c.x() - k, c.y() + k), QPointF(c.x() + k, c.y() - k))
             if getattr(self.tabData(i), "audible", False):          # speaker badge on a tab that is playing sound
                 btn = self.tabButton(i, QTabBar.ButtonPosition.RightSide)
                 x = r.right() - (38 if (btn is not None and btn.isVisible()) else 22)
@@ -2672,12 +2782,18 @@ class TabBar(QTabBar):
                     self._spk = pm_icon("speaker", "#ffd3d8", size=32)
                 p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
                 p.drawPixmap(QRectF(x, r.center().y() - 7, 14, 14).toRect(), self._spk)
+            p.setOpacity(1.0)
         p.end()
         super().paintEvent(e)
 
     # ---- mouse ------------------------------------------------------------------------
     def leaveEvent(self, e):
         self._hover = -1
+        self._ch = -1
+        self._pc = None
+        if self._hold:
+            self._hold = False
+            self.refit(True)                             # tabs spread back out once the mouse has left
         self._apply_close()
         self._ease_start()
         self.update()
@@ -2691,6 +2807,11 @@ class TabBar(QTabBar):
             e.accept()
             return
         self._empty = False
+        if e.button() == Qt.MouseButton.LeftButton and i >= 0 and self._close_vis(i) and self._cr(i).contains(QPointF(pos)):
+            self._pc = i                                 # pressing an X must not select or drag the tab
+            self.update()
+            e.accept()
+            return
         if e.button() == Qt.MouseButton.LeftButton:
             self._on_tab = True
             self._dragging = False
@@ -2700,8 +2821,11 @@ class TabBar(QTabBar):
     def mouseMoveEvent(self, e):
         pos = e.position().toPoint()
         h = self.tabAt(pos)
-        if h != self._hover:
+        ch = h if (h >= 0 and self._close_vis(h) and self._cr(h).contains(QPointF(pos))) else -1
+        if h != self._hover or ch != self._ch:
             self._hover = h
+            self._ch = ch
+            self.setCursor(Qt.CursorShape.PointingHandCursor if ch >= 0 else Qt.CursorShape.ArrowCursor)
             self._apply_close()
             self._ease_start()
             self.update()
@@ -2721,9 +2845,18 @@ class TabBar(QTabBar):
         if self._empty:
             self._empty = False
             return
+        if self._pc is not None:
+            i, self._pc = self._pc, None
+            self.update()
+            if e.button() == Qt.MouseButton.LeftButton and i < self.count() and self._cr(i).contains(QPointF(e.position())):
+                self._hold = True
+                self.tabCloseRequested.emit(i)
+            e.accept()
+            return
         if e.button() == Qt.MouseButton.MiddleButton:          # middle-click closes a tab
             i = self.tabAt(e.position().toPoint())
             if i >= 0:
+                self._hold = True
                 self.tabCloseRequested.emit(i)
                 e.accept()
                 return
@@ -2949,7 +3082,7 @@ class Browser(QMainWindow):
         self.tabbar = TabBar(self, documentMode=True, tabsClosable=True, movable=True,
                              expanding=False, drawBase=False)
         self.tabbar.setElideMode(Qt.TextElideMode.ElideRight)
-        self.tabbar.tabCloseRequested.connect(self.close_tab)
+        self.tabbar.tabCloseRequested.connect(self.close_tab_animated)
         self.tabbar.currentChanged.connect(self.show_tab)
         tl.addWidget(self.tabbar)
         newtab = HoverButton(objectName="nav", toolTip="New tab (Ctrl+T)")
@@ -3138,7 +3271,7 @@ class Browser(QMainWindow):
         _mark("init_ui")
 
         for key, fn in [("Ctrl+T", lambda: self.add_tab("start")),
-                        ("Ctrl+W", lambda: self.close_tab(self.tabbar.currentIndex())),
+                        ("Ctrl+W", lambda: self.close_tab_animated(self.tabbar.currentIndex())),
                         ("Ctrl+L", self.focus_bar), ("Ctrl+D", self.toggle_bookmark), ("Ctrl+Shift+T", self.reopen_tab), ("Ctrl+H", self.show_history),
                         ("Ctrl+Shift+B", self.toggle_bm_bar), ("F5", lambda: self.cur().reload()),
                         ("Alt+Left", lambda: self.cur().back()),
@@ -3637,6 +3770,11 @@ class Browser(QMainWindow):
         if not audible:                               # sound stopped: the background tab can be frozen now
             self._freeze_if_idle(v)
 
+    def close_tab_animated(self, i):
+        if i < 0:
+            return
+        self.tabbar.close_animated(i)
+
     def close_tab(self, i):
         d = self.tabbar.tabData(i)
         if self.tabbar.count() <= 1:
@@ -3944,7 +4082,7 @@ class Browser(QMainWindow):
         m.addAction("Reload", lambda: self.reload_tab(v))
         m.addAction("Duplicate", lambda: self.add_tab("start" if getattr(v, "is_start", False) else v.url().toString()))
         m.addSeparator()
-        m.addAction("Close", lambda: self.close_tab(self.tab_of(v)))
+        m.addAction("Close", lambda: self.close_tab_animated(self.tab_of(v)))
         m.addAction("Close other tabs", lambda: self.close_others(v))
         m.addAction("Close tabs to the right", lambda: self.close_right(v))
         if self.closed_tabs:
