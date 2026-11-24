@@ -121,7 +121,7 @@ SEARCH = "https://www.google.com/search?q="
 Life = QWebEnginePage.LifecycleState
 
 # ---------------------------------------------------------------- liquid-glass theme
-BG_GRAD = ("qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #3a0916,stop:0.5 #1a050d,stop:1 #0c0206)")
+BG_GRAD = ("qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #47081a,stop:0.5 #1f0510,stop:1 #0d0207)")
 GLASS = ("qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 rgba(255,255,255,52),"
          "stop:0.5 rgba(255,255,255,26),stop:1 rgba(255,255,255,14))")
 STYLE = f"""
@@ -137,16 +137,15 @@ QToolButton#shield {{ padding:0 14px 0 10px; font-size:12px; font-weight:600; co
 QTabBar::close-button {{ image:url("__CLOSE__"); subcontrol-position:right; margin-right:4px;
   border-radius:8px; padding:2px; }}
 QTabBar::close-button:hover {{ background:rgba(255,255,255,60); }}
-QLineEdit {{ background:rgba(255,255,255,20); color:#fff3f4; border:1px solid rgba(255,255,255,26);
-  border-radius:12px; padding:0 12px; selection-background-color:#ff4d5e; font-size:13px; }}
-QLineEdit:hover {{ background:rgba(255,255,255,28); }}
-QLineEdit:focus {{ border:1px solid rgba(255,110,125,230); background:rgba(0,0,0,110); }}
+QLineEdit {{ background:rgba(0,0,0,72); color:#fff3f4; border:1px solid rgba(255,255,255,48);
+  border-radius:19px; padding:0 14px; selection-background-color:#ff4d5e; font-size:13px; }}
+QLineEdit:focus {{ border:1.5px solid rgba(255,110,125,240); background:rgba(0,0,0,120); }}
 QWidget#bmbar {{ background:transparent; }}
 QToolButton#chip {{ background:transparent; border:none; color:#f3d6da; padding:0 11px 0 8px; font-size:12px; }}
 QToolButton#chip:hover {{ color:#ffffff; }}
 QLabel#clock {{ color:#f3d6da; font-size:13px; font-weight:600; padding:0 8px; }}
 QLabel#hint {{ color:#a77880; font-size:12px; padding-left:6px; }}
-QFrame#extpanel {{ background:rgba(30,8,15,252); border:1px solid rgba(255,255,255,34); border-radius:18px; }}
+QFrame#extpanel {{ background:rgba(48,8,18,250); border:1px solid rgba(255,255,255,70); border-radius:18px; }}
 QLabel#exttitle {{ color:#fff3f4; font-size:16px; font-weight:600; }}
 QLabel#extname {{ color:#fbe6e8; font-size:13px; }}
 QLabel#extmuted {{ color:#a77880; font-size:12px; padding:10px; }}
@@ -157,8 +156,8 @@ QPushButton#extaction {{ background:transparent; border:none; border-radius:12px
   text-align:left; color:#fbe6e8; font-size:13px; }}
 QPushButton#extaction:hover {{ background:rgba(255,255,255,28); }}
 QLabel#extmeta {{ color:#b88a92; font-size:11.5px; }}
-QFrame#storepill {{ background:rgba(255,255,255,20); border:1px solid rgba(255,255,255,30); border-radius:16px; }}
-QFrame#settings {{ background:rgba(28,7,14,252); border:1px solid rgba(255,255,255,34); border-radius:20px; }}
+QFrame#storepill {{ background:{GLASS}; border:1px solid rgba(255,255,255,60); border-radius:18px; }}
+QFrame#settings {{ background:rgba(40,7,16,250); border:1px solid rgba(255,255,255,70); border-radius:22px; }}
 QLabel#settitle {{ color:#fff3f4; font-size:22px; font-weight:600; }}
 QScrollArea {{ background:transparent; border:none; }}
 QScrollArea > QWidget > QWidget {{ background:transparent; }}
@@ -167,16 +166,16 @@ QScrollBar::handle:vertical {{ background:rgba(255,255,255,60); border-radius:3p
 QScrollBar::handle:vertical:hover {{ background:rgba(255,255,255,105); }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background:transparent; }}
-QProgressBar {{ background:transparent; border:none; max-height:2px; min-height:2px; margin:0 14px; }}
+QProgressBar {{ background:transparent; border:none; max-height:2px; min-height:2px; margin:0 22px; }}
 QProgressBar::chunk {{ background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #ff4d5e,stop:1 #ff9aa5);
   border-radius:1px; }}
-QMenu {{ background:rgba(30,8,15,250); color:#fbe6e8; border:1px solid rgba(255,255,255,34);
-  border-radius:14px; padding:6px; }}
-QMenu::item {{ padding:7px 26px 7px 14px; border-radius:8px; margin:1px 0; }}
-QMenu::item:selected {{ background:rgba(255,255,255,28); }}
+QMenu {{ background:rgba(52,9,20,245); color:#fbe6e8; border:1px solid rgba(255,255,255,60);
+  border-radius:14px; padding:7px; }}
+QMenu::item {{ padding:7px 28px; border-radius:8px; }}
+QMenu::item:selected {{ background:rgba(255,255,255,40); }}
 QMenu::item:disabled {{ color:#9a6f76; }}
-QMenu::separator {{ height:1px; background:rgba(255,255,255,24); margin:5px 8px; }}
-QLabel#toast {{ background:rgba(40,10,19,245); color:#fff3f4; border:1px solid rgba(255,255,255,44);
+QMenu::separator {{ height:1px; background:rgba(255,255,255,40); margin:6px 8px; }}
+QLabel#toast {{ background:{GLASS}; color:#fff3f4; border:1px solid rgba(255,255,255,80);
   border-radius:14px; padding:9px 16px; }}
 QToolTip {{ background:#3d0a15; color:#fbe6e8; border:1px solid rgba(255,255,255,60);
   border-radius:6px; padding:4px 8px; }}
@@ -407,49 +406,55 @@ def letter_icon(name, size=48):
 START_HTML = """<!doctype html><meta charset=utf-8><title>New Tab</title>
 <style>
 *{box-sizing:border-box}
-html,body{height:100%;margin:0;color:#fff3f4;font-family:-apple-system,"SF Pro Display","Segoe UI Variable Display","Segoe UI",system-ui,sans-serif}
-body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:26px;
-background:radial-gradient(900px 560px at 10% 0%,rgba(225,35,65,.30),transparent 62%),
-radial-gradient(760px 600px at 100% 100%,rgba(150,15,50,.42),transparent 62%),
-linear-gradient(165deg,#220710,#0c0206)}
-#clk{text-align:center;animation:rise .8s cubic-bezier(.2,.8,.2,1) backwards}
-#time{font-size:84px;font-weight:200;letter-spacing:-3px;line-height:1;color:#fff6f7;text-shadow:0 4px 40px rgba(255,60,85,.35)}
-#date{font-size:14px;color:#d9a4ac;margin-top:10px;letter-spacing:.3px}
-.brand{display:flex;align-items:center;gap:10px;margin-top:6px;opacity:.9;animation:rise .8s .06s cubic-bezier(.2,.8,.2,1) backwards}
-.brand span{font-size:15px;font-weight:600;letter-spacing:.4px;color:#f0cfd4}
-.brand svg{width:22px;height:22px}
-form{width:min(600px,88vw);animation:rise .8s .12s cubic-bezier(.2,.8,.2,1) backwards}
-input{width:100%;padding:15px 22px;font-size:16px;color:#fff3f4;border-radius:16px;outline:none;
-border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.07);
-transition:border-color .25s,box-shadow .25s,background .25s}
-input::placeholder{color:#c99aa2}
-input:hover{background:rgba(255,255,255,.10)}
-input:focus{border-color:rgba(255,110,125,.85);background:rgba(0,0,0,.30);box-shadow:0 0 0 4px rgba(255,77,94,.16)}
-.cards{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;padding:0 20px;margin-top:6px}
-.card{width:214px;padding:16px 18px;border-radius:18px;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.09);
-animation:rise .8s cubic-bezier(.2,.8,.2,1) backwards;transition:transform .3s cubic-bezier(.2,.8,.2,1),background .3s,border-color .3s}
-.card:nth-child(1){animation-delay:.2s}.card:nth-child(2){animation-delay:.27s}.card:nth-child(3){animation-delay:.34s}
-.card:hover{transform:translateY(-3px);background:rgba(255,255,255,.09);border-color:rgba(255,255,255,.18)}
-.lab{font-size:10.5px;letter-spacing:1px;white-space:nowrap;text-transform:uppercase;color:#d9a4ac}
-.val{font-size:26px;font-weight:600;margin:7px 0 2px;letter-spacing:-.4px}
-.sub{font-size:11.5px;color:#b88a92}
-.note{font-size:11px;color:#8f666e;margin-top:-6px;animation:rise .8s .45s ease backwards}
-@keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+html,body{height:100%;margin:0;color:#fff3f4;font-family:-apple-system,"SF Pro Display","Segoe UI",system-ui,sans-serif}
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:34px;
+background:radial-gradient(900px 600px at 12% 8%,rgba(230,40,65,.42),transparent 60%),
+radial-gradient(800px 650px at 92% 92%,rgba(160,15,45,.55),transparent 60%),
+linear-gradient(160deg,#2c060e,#12030a)}
+#clk{position:fixed;left:38px;top:30px;text-align:left;text-shadow:0 2px 24px rgba(255,60,80,.45)}
+#time{font-size:36px;font-weight:600;letter-spacing:-.5px;line-height:1}
+#date{font-size:13px;color:#d9a4ac;margin-top:7px}
+.brand{display:flex;align-items:center;gap:18px;animation:rise .9s .05s cubic-bezier(.2,.8,.2,1) backwards}
+.brand span{font-size:62px;font-weight:700;letter-spacing:-1.6px;color:#f6e3e6}
+.brand svg{width:70px;height:70px;filter:drop-shadow(0 0 18px rgba(255,70,95,.55))}
+.glass{background:linear-gradient(145deg,rgba(255,255,255,.20),rgba(255,255,255,.08));
+border:1px solid rgba(255,255,255,.2);
+box-shadow:0 12px 40px rgba(0,0,0,.4),inset 0 1px 0 rgba(255,255,255,.28)}
+form{width:min(580px,86vw)}
+input{width:100%;padding:15px 24px;font-size:16px;color:#fff3f4;border-radius:32px;outline:none;
+border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.28);
+box-shadow:inset 0 1px 0 rgba(255,255,255,.14)}
+input::placeholder{color:#c99aa2}input:focus{border-color:rgba(255,110,125,.9);box-shadow:0 0 0 4px rgba(255,77,94,.2)}
+.cards{display:flex;gap:16px;flex-wrap:wrap;justify-content:center;padding:0 20px}
+.card{width:210px;padding:20px 22px;border-radius:26px}
+.lab{font-size:11px;letter-spacing:1.2px;text-transform:uppercase;color:#d9a4ac}
+.val{font-size:32px;font-weight:600;margin:8px 0 4px;letter-spacing:-.5px}
+.sub{font-size:12px;color:#c99aa2}
+.note{font-size:11px;color:#a77880;margin-top:-14px}
+@keyframes rise{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+#clk{animation:rise .9s cubic-bezier(.2,.8,.2,1) backwards}
+form{animation:rise .9s .1s cubic-bezier(.2,.8,.2,1) backwards}
+.card{animation:rise .9s cubic-bezier(.2,.8,.2,1) backwards;transition:transform .3s cubic-bezier(.2,.8,.2,1),box-shadow .3s,border-color .3s}
+.card:nth-child(1){animation-delay:.22s}.card:nth-child(2){animation-delay:.3s}.card:nth-child(3){animation-delay:.38s}
+.card:hover{transform:translateY(-6px) scale(1.02);border-color:rgba(255,255,255,.34);box-shadow:0 20px 50px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.35)}
+.note{animation:rise .9s .5s ease backwards}
+input{transition:border-color .25s,box-shadow .25s,transform .25s}
+input:focus{transform:scale(1.02)}
 body::before,body::after{content:"";position:fixed;width:70vmax;height:70vmax;border-radius:50%;pointer-events:none;z-index:-1;will-change:transform}
-body::before{left:-25vmax;top:-30vmax;background:radial-gradient(circle,rgba(225,29,72,.26),transparent 65%);animation:d1 24s ease-in-out infinite alternate}
-body::after{right:-28vmax;bottom:-34vmax;background:radial-gradient(circle,rgba(150,15,45,.4),transparent 65%);animation:d2 30s ease-in-out infinite alternate}
+body::before{left:-25vmax;top:-30vmax;background:radial-gradient(circle,rgba(225,29,72,.34),transparent 65%);animation:d1 24s ease-in-out infinite alternate}
+body::after{right:-28vmax;bottom:-34vmax;background:radial-gradient(circle,rgba(150,15,45,.5),transparent 65%);animation:d2 30s ease-in-out infinite alternate}
 @keyframes d1{to{transform:translate(14vmax,10vmax) scale(1.15)}}
 @keyframes d2{to{transform:translate(-12vmax,-8vmax) scale(1.2)}}
 body.still::before,body.still::after{animation-play-state:paused;will-change:auto}
 @media(prefers-reduced-motion:reduce){*,::before,::after{animation:none!important;transition:none!important}}
 </style>
 <div id="clk"><div id="time"></div><div id="date"></div></div>
+<div class="brand"><svg viewBox="0 0 48 48" fill="none" stroke="#ff6b7d" stroke-width="3.4" stroke-linecap="round"><circle cx="24" cy="24" r="17"/><ellipse cx="24" cy="24" rx="7.6" ry="17"/><path d="M7 24h34"/></svg><span>LiteBrowser</span></div>
 <form action="https://www.google.com/search" method="get"><input name="q" autofocus autocomplete="off" placeholder="Search Google or type a URL"></form>
-<div class="brand"><svg viewBox="0 0 48 48" fill="none" stroke="#ff6b7d" stroke-width="3.6" stroke-linecap="round"><circle cx="24" cy="24" r="17"/><ellipse cx="24" cy="24" rx="7.6" ry="17"/><path d="M7 24h34"/></svg><span>LiteBrowser</span></div>
 <div class="cards">
-<div class="card"><div class="lab">Trackers &amp; ads blocked</div><div class="val" id="b">0</div><div class="sub">all time</div></div>
-<div class="card"><div class="lab">Bandwidth saved</div><div class="val" id="d">0 B</div><div class="sub">all time</div></div>
-<div class="card"><div class="lab">Time saved</div><div class="val" id="t">0 s</div><div class="sub">all time</div></div>
+<div class="card glass"><div class="lab">Trackers &amp; ads blocked</div><div class="val" id="b">0</div><div class="sub">all time</div></div>
+<div class="card glass"><div class="lab">Bandwidth saved</div><div class="val" id="d">0 B</div><div class="sub">all time</div></div>
+<div class="card glass"><div class="lab">Time saved</div><div class="val" id="t">0 s</div><div class="sub">all time</div></div>
 </div>
 <div class="note">Bandwidth and time are estimates based on typical resource sizes.</div>
 <script>
@@ -1087,8 +1092,8 @@ def fade_in_window(w, dur=180, slide=10):
 
 
 # (idle bg alpha, hover bg alpha, idle border alpha, hover border alpha)
-BTN_ALPHA = {"nav": (0, 30, 0, 0), "shield": (14, 40, 26, 60),
-             "chip": (0, 30, 0, 0), "flat": (0, 30, 0, 0)}
+BTN_ALPHA = {"nav": (0, 46, 0, 0), "shield": (18, 50, 40, 90),
+             "chip": (16, 46, 28, 85), "flat": (0, 46, 0, 0)}
 
 
 class HoverButton(QToolButton):
@@ -1146,7 +1151,7 @@ class HoverButton(QToolButton):
             r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
             p.setBrush(QColor(255, 255, 255, int(min(a, 255))))
             p.setPen(QPen(QColor(255, 255, 255, int(bd)), 1) if bd > 0 else Qt.PenStyle.NoPen)
-            rad = 10 if self.objectName() in ("nav", "flat") else r.height() / 2
+            rad = r.height() / 2
             p.drawRoundedRect(r, rad, rad)
             p.end()
         super().paintEvent(e)
@@ -2241,14 +2246,15 @@ class Backdrop(QWidget):
     def _render():
         w, h = 640, 360
         pm = QPixmap(w, h)
-        pm.fill(QColor("#0c0206"))
+        pm.fill(QColor("#12030a"))
         p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
-        for fx, fy, fr, (r, g, b, a) in [(0.06, 0.04, 0.60, (225, 29, 72, 120)),
-                                          (0.90, 0.10, 0.42, (255, 92, 58, 56)),
-                                          (0.26, 0.96, 0.52, (150, 15, 62, 105)),
-                                          (0.98, 0.92, 0.50, (205, 22, 92, 90))]:
+        for fx, fy, fr, (r, g, b, a) in [(0.10, 0.08, 0.62, (225, 29, 72, 170)),
+                                          (0.82, 0.14, 0.50, (255, 92, 58, 105)),
+                                          (0.30, 0.82, 0.55, (150, 15, 62, 165)),
+                                          (0.96, 0.88, 0.55, (205, 22, 92, 135)),
+                                          (0.58, 0.46, 0.38, (125, 22, 88, 80))]:
             rad = fr * max(w, h)
             c = QPointF(fx * w, fy * h)
             gr = QRadialGradient(c, rad)
@@ -2340,15 +2346,20 @@ class UrlBar(QLineEdit):
 
 
 class GlassBar(QWidget):
-    """Soft rounded container behind the toolbar row (redesign v4)."""
+    """Floating rounded glass capsule behind the toolbar row (redesign v4)."""
 
     def paintEvent(self, e):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        p.setBrush(QColor(255, 255, 255, 11))
-        p.setPen(QPen(QColor(255, 255, 255, 22), 1))
-        p.drawRoundedRect(r, 16, 16)
+        g = QLinearGradient(0, r.top(), 0, r.bottom())
+        g.setColorAt(0, QColor(255, 255, 255, 34))
+        g.setColorAt(1, QColor(255, 255, 255, 12))
+        p.setBrush(g)
+        p.setPen(QPen(QColor(255, 255, 255, 46), 1))
+        p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))        # top highlight
+        p.drawLine(QPointF(r.left() + r.height() / 2, r.top() + 0.5), QPointF(r.right() - r.height() / 2, r.top() + 0.5))
         p.end()
 
 
@@ -2359,7 +2370,7 @@ class CardFrame(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255, 34), 1))
+        p.setPen(QPen(QColor(255, 255, 255, 64), 1))
         p.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 16, 16)
         p.end()
 
@@ -2603,26 +2614,20 @@ class TabBar(QTabBar):
                 r.moveLeft(max(2.0, min(self._mx - self._grab + 2, self.width() - r.width() - 2.0)))
             tint = getattr(self.tabData(i), "tint", None) or QColor(255, 96, 118)
             sel = i == cur
-            hov = i == self._hover
-            if sel or hov:
-                g = QLinearGradient(r.left(), r.top(), r.right(), r.bottom())
-                c1, c2 = QColor(tint), QColor(tint)
-                c1.setAlpha(96 if sel else 40)
-                c2.setAlpha(34 if sel else 12)
-                g.setColorAt(0, c1)
-                g.setColorAt(1, c2)
-                p.setBrush(QBrush(g))
+            a1, a2 = (135, 46) if sel else ((84, 26) if i == self._hover else (52, 12))
+            g = QLinearGradient(r.left(), 0, r.right(), 0)
+            c1, c2 = QColor(tint), QColor(tint)
+            c1.setAlpha(a1)
+            c2.setAlpha(a2)
+            g.setColorAt(0, c1)
+            g.setColorAt(1, c2)
+            p.setBrush(QBrush(g))
+            p.setPen(QPen(QColor(255, 255, 255, 96 if sel else 34), 1))
+            p.drawRoundedRect(r, 11, 11)
+            if sel:
+                p.setBrush(QColor(255, 255, 255, 20))
                 p.setPen(Qt.PenStyle.NoPen)
-                p.drawRoundedRect(r, 12, 12)
-                p.setBrush(QColor(255, 255, 255, 26 if sel else 10))
-                p.setPen(QPen(QColor(255, 255, 255, 52 if sel else 0), 1) if sel else Qt.PenStyle.NoPen)
-                p.drawRoundedRect(r, 12, 12)
-            else:                                   # idle tab: just a thin tinted dot-line under the pill area
-                c = QColor(tint)
-                c.setAlpha(70)
-                p.setBrush(c)
-                p.setPen(Qt.PenStyle.NoPen)
-                p.drawRoundedRect(QRectF(r.center().x() - 7, r.bottom() - 1.5, 14, 2), 1, 1)
+                p.drawRoundedRect(r, 11, 11)
             if getattr(self.tabData(i), "audible", False):          # speaker badge on a tab that is playing sound
                 btn = self.tabButton(i, QTabBar.ButtonPosition.RightSide)
                 x = r.right() - (38 if (btn is not None and btn.isVisible()) else 22)
@@ -2937,7 +2942,7 @@ class Browser(QMainWindow):
         self.reload_btn = nav_btn("reload", "Reload", self.reload_or_stop)
         row.addWidget(self.reload_btn)
         self.urlbar = UrlBar(placeholderText="Search with Google or enter address")
-        self.urlbar.setFixedHeight(36)
+        self.urlbar.setFixedHeight(38)
         self.urlbar.returnPressed.connect(self.navigate)
         self.sug = Suggest(self)
         self.urlbar.sug = self.sug
