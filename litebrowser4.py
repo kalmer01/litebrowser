@@ -42,6 +42,19 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join([
     "--metrics-recording-only", "--log-level=3",
 ])
 
+try:
+    import PyQt6.QtWebEngineWidgets, PyQt6.QtWebEngineCore, PyQt6.QtNetwork       # noqa: F401
+except Exception as _e:                      # double-clicked with a Python that lacks PyQt6: say so instead of vanishing
+    _msg = ("LiteBrowser needs PyQt6, but this Python (%s) can't load it:\n%s\n\nOpen Command Prompt and run:\n"
+            "python -m pip install -U \"PyQt6>=6.10\" \"PyQt6-WebEngine>=6.10\"\n\nThen start LiteBrowser again "
+            "(use run_litebrowser.bat from the folder)." % (sys.executable, _e))
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, _msg, "LiteBrowser", 0x10)
+    except Exception:
+        print(_msg)
+        input("Press Enter to close...")
+    sys.exit(1)
 from PyQt6.QtCore import (QEasingCurve, QEvent, QRect, QStandardPaths, QVariantAnimation, QObject, QParallelAnimationGroup, QPoint, QPointF, QPropertyAnimation,
                           QRectF, QSize, Qt, QTimer, QUrl, QDateTime, pyqtProperty, pyqtSignal)
 from PyQt6.QtGui import QBitmap, QBrush, QCursor, QLinearGradient, QRadialGradient
@@ -64,9 +77,28 @@ DATA = Path(os.environ.get("LITEBROWSER_DATA") or (Path.home() / ".litebrowser")
 _mark("imports_done")
 
 # ---------------------------------------------------------------- self-update (single file)
-APP_VERSION = "4.0.4"          # bump this whenever you publish a new litebrowser4.py
+APP_VERSION = "4.0.5"          # bump this whenever you publish a new litebrowser4.py
 UPDATE_URL = ""                # direct link to the raw litebrowser4.py (e.g. a GitHub "Raw" link); or set it in the menu
 UPDATE_FILE = DATA / "litebrowser_update.py"   # used by the .exe build, which can't overwrite itself
+
+
+def _fatal(title, text):
+    """Start-up problems: write them to error.log and show a message box (a console would just flash and vanish)."""
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        with open(DATA / "error.log", "a", encoding="utf-8") as f:
+            f.write(title + "\n" + text + "\n")
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, text[-1800:], title, 0x10)
+    except Exception:
+        try:
+            print(title + "\n" + text)
+            input("Press Enter to close...")
+        except Exception:
+            pass
 
 
 def _ver(text):
@@ -1730,8 +1762,9 @@ def send_to_running(arg):
         sock.write((arg + "\n").encode("utf-8"))
         sock.flush()
         sock.waitForBytesWritten(400)
+        answered = sock.waitForReadyRead(2500)            # a healthy window answers at once; a stuck leftover process never does
         sock.disconnectFromServer()
-        return True
+        return bool(answered)
     return False
 
 
@@ -1743,6 +1776,11 @@ def on_instance_connection(server, win):
     def read():
         data = bytes(sock.readAll()).decode("utf-8", "ignore").strip()
         win.open_external(data)
+        try:
+            sock.write(b"ok\n")
+            sock.flush()
+        except Exception:
+            pass
         sock.disconnectFromServer()
     if sock.bytesAvailable():
         read()
@@ -5529,110 +5567,127 @@ def start_bench(win, app, out_path):
 
 
 if __name__ == "__main__":
-    # pythonw has no console: send output to a log file and keep the app alive on stray errors
-    if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w")
-    if sys.stderr is None:
-        try:
-            DATA.mkdir(parents=True, exist_ok=True)
-            sys.stderr = open(DATA / "error.log", "a", buffering=1, encoding="utf-8")
-        except Exception:
-            sys.stderr = open(os.devnull, "w")
-
-    def _hook(t, v, tb):
-        try:
-            import traceback
-            sys.stderr.write("".join(traceback.format_exception(t, v, tb)) + "\n")
-        except Exception:
-            pass
-    sys.excepthook = _hook
     try:
-        import faulthandler                  # a native crash then leaves the Python stack in error.log
-        faulthandler.enable(file=sys.stderr, all_threads=True)
-    except Exception:
-        pass
-    app = QApplication(sys.argv)
-    _mark("qapp_created")
-    argv = sys.argv[1:]
-    bench_out = None
-    if "--bench-out" in argv:         # benchmark mode: isolated run, writes a JSON report and quits
-        k = argv.index("--bench-out")
-        bench_out = argv[k + 1] if k + 1 < len(argv) else None
-        del argv[k:k + 2]
-    arg = normalize_arg(argv[0]) if argv else ""
-    if not bench_out and send_to_running(arg):          # already running: pass the link over and quit
-        sys.exit(0)
-    icons = DATA / "icons"
-    icons.mkdir(parents=True, exist_ok=True)
-    ico = icons / "litebrowser.ico"
-    if ico.exists() and ico.stat().st_size > 0:          # drawn once, then reused (saves time on every start)
-        app_icon = QIcon(str(ico))
-        APP_ICON_PATH = str(ico)
-    else:
-        app_pm = make_app_icon()
-        if app_pm.save(str(ico), "ICO"):
-            APP_ICON_PATH = str(ico)
-        app_icon = QIcon(app_pm)
-    app.setWindowIcon(app_icon)
-    splash = None
-    if not bench_out:                                    # something to look at while the engine starts
-        splash = Splash(app_icon)
-        splash.show()
-        app.processEvents()
-    app.setStyle("Fusion")
-    app.setPalette(make_palette())
-    close_png = icons / "close.png"
-    if not close_png.exists():
-        pm_icon("close", "#f3d6da", size=16, width=5).save(str(close_png))
-    app.setStyleSheet(STYLE.replace("__CLOSE__", close_png.as_posix()))
-    _mark("style_icons_done")
-    if bench_out and os.environ.get("LB_PROFILE"):       # benchmark.py --profile: where does window start-up time go?
-        import cProfile
-        import io as _io
-        import pstats
-        pr = cProfile.Profile()
-        pr.enable()
-        win = Browser(arg)
-        pr.disable()
-        buf = _io.StringIO()
-        pstats.Stats(pr, stream=buf).sort_stats("cumulative").print_stats(45)
-        Path(bench_out + ".profile.txt").write_text(buf.getvalue(), encoding="utf-8")
-    else:
-        win = Browser(arg)
-    _mark("browser_built")
-    if not bench_out:
-        server = QLocalServer()
-        QLocalServer.removeServer(SERVER_NAME)
-        server.listen(SERVER_NAME)
-        server.newConnection.connect(lambda: on_instance_connection(server, win))
-    app.aboutToQuit.connect(win.cookies.save)
-    app.aboutToQuit.connect(win.adblock.save)
-    app.aboutToQuit.connect(win.save_session)
-    app.aboutToQuit.connect(win.history.flush)
-    win.show()
-    _mark("shown")
-    if not bench_out:
+        # pythonw has no console: send output to a log file and keep the app alive on stray errors
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w")
+        if sys.stderr is None:
+            try:
+                DATA.mkdir(parents=True, exist_ok=True)
+                sys.stderr = open(DATA / "error.log", "a", buffering=1, encoding="utf-8")
+            except Exception:
+                sys.stderr = open(os.devnull, "w")
+
+        def _hook(t, v, tb):
+            try:
+                import traceback
+                sys.stderr.write("".join(traceback.format_exception(t, v, tb)) + "\n")
+            except Exception:
+                pass
+        sys.excepthook = _hook
         try:
-            win.setWindowOpacity(0.0)
-            _oa = QPropertyAnimation(win, b"windowOpacity", win)
-            _oa.setDuration(240)
-            _oa.setStartValue(0.0)
-            _oa.setEndValue(1.0)
-            _oa.setEasingCurve(QEasingCurve.Type.OutCubic)
-            _oa.finished.connect(lambda: win.setWindowOpacity(1.0))
-            _oa.start()
-            win._open_anim = _oa
+            import faulthandler                  # a native crash then leaves the Python stack in error.log
+            faulthandler.enable(file=sys.stderr, all_threads=True)
         except Exception:
             pass
-    if splash is not None:
-        splash.close()
-    if bench_out:
-        start_bench(win, app, bench_out)
-    import gc                      # fewer/shorter garbage-collection pauses
-    gc.collect()
-    gc.freeze()
-    gc.set_threshold(40000, 25, 25)
-    _rc = app.exec()
-    if not bench_out:
-        win.shutdown_web()
-    sys.exit(_rc)
+        app = QApplication(sys.argv)
+        _mark("qapp_created")
+        argv = sys.argv[1:]
+        bench_out = None
+        if "--bench-out" in argv:         # benchmark mode: isolated run, writes a JSON report and quits
+            k = argv.index("--bench-out")
+            bench_out = argv[k + 1] if k + 1 < len(argv) else None
+            del argv[k:k + 2]
+        arg = normalize_arg(argv[0]) if argv else ""
+        if not bench_out and send_to_running(arg):          # already running: pass the link over and quit
+            sys.exit(0)
+        icons = DATA / "icons"
+        icons.mkdir(parents=True, exist_ok=True)
+        ico = icons / "litebrowser.ico"
+        if ico.exists() and ico.stat().st_size > 0:          # drawn once, then reused (saves time on every start)
+            app_icon = QIcon(str(ico))
+            APP_ICON_PATH = str(ico)
+        else:
+            app_pm = make_app_icon()
+            if app_pm.save(str(ico), "ICO"):
+                APP_ICON_PATH = str(ico)
+            app_icon = QIcon(app_pm)
+        app.setWindowIcon(app_icon)
+        splash = None
+        if not bench_out:                                    # something to look at while the engine starts
+            splash = Splash(app_icon)
+            splash.show()
+            app.processEvents()
+        app.setStyle("Fusion")
+        app.setPalette(make_palette())
+        close_png = icons / "close.png"
+        if not close_png.exists():
+            pm_icon("close", "#f3d6da", size=16, width=5).save(str(close_png))
+        app.setStyleSheet(STYLE.replace("__CLOSE__", close_png.as_posix()))
+        _mark("style_icons_done")
+        if bench_out and os.environ.get("LB_PROFILE"):       # benchmark.py --profile: where does window start-up time go?
+            import cProfile
+            import io as _io
+            import pstats
+            pr = cProfile.Profile()
+            pr.enable()
+            win = Browser(arg)
+            pr.disable()
+            buf = _io.StringIO()
+            pstats.Stats(pr, stream=buf).sort_stats("cumulative").print_stats(45)
+            Path(bench_out + ".profile.txt").write_text(buf.getvalue(), encoding="utf-8")
+        else:
+            win = Browser(arg)
+        _mark("browser_built")
+        if not bench_out:
+            server = QLocalServer()
+            QLocalServer.removeServer(SERVER_NAME)
+            server.listen(SERVER_NAME)
+            server.newConnection.connect(lambda: on_instance_connection(server, win))
+        app.aboutToQuit.connect(win.cookies.save)
+        app.aboutToQuit.connect(win.adblock.save)
+        app.aboutToQuit.connect(win.save_session)
+        app.aboutToQuit.connect(win.history.flush)
+        win.show()
+        _mark("shown")
+        if not bench_out:
+            try:
+                win.setWindowOpacity(0.0)
+                _oa = QPropertyAnimation(win, b"windowOpacity", win)
+                _oa.setDuration(240)
+                _oa.setStartValue(0.0)
+                _oa.setEndValue(1.0)
+                _oa.setEasingCurve(QEasingCurve.Type.OutCubic)
+                _oa.finished.connect(lambda: win.setWindowOpacity(1.0))
+                _oa.start()
+                win._open_anim = _oa
+            except Exception:
+                pass
+        if splash is not None:
+            splash.close()
+        if bench_out:
+            start_bench(win, app, bench_out)
+        import gc                      # fewer/shorter garbage-collection pauses
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(40000, 25, 25)
+        _rc = app.exec()
+        if not bench_out:
+            _wd = threading.Timer(4.0, lambda: os._exit(0))   # if the engine ever hangs while closing, still end the process
+            _wd.daemon = True
+            _wd.start()
+            win.shutdown_web()
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(_rc)                                    # no hidden leftover process that blocks the next start
+        sys.exit(_rc)
+
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback
+        _fatal("LiteBrowser could not start", traceback.format_exc())
+        os._exit(1)
