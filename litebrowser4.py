@@ -69,7 +69,7 @@ try:
     from PyQt6.QtWebEngineCore import QWebEnginePermission
 except ImportError:                      # Qt older than 6.8: no permission prompts
     QWebEnginePermission = None
-from PyQt6.QtWidgets import (QAbstractButton, QApplication, QGraphicsOpacityEffect, QScrollArea, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+from PyQt6.QtWidgets import (QSystemTrayIcon, QMessageBox, QAbstractButton, QApplication, QGraphicsOpacityEffect, QScrollArea, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
                              QFrame, QMainWindow, QMenu, QProgressBar, QStackedWidget, QTabBar,
                              QToolButton, QVBoxLayout, QWidget)
 
@@ -77,7 +77,7 @@ DATA = Path(os.environ.get("LITEBROWSER_DATA") or (Path.home() / ".litebrowser")
 _mark("imports_done")
 
 # ---------------------------------------------------------------- self-update (single file)
-APP_VERSION = "4.0.6"          # bump this whenever you publish a new litebrowser4.py
+APP_VERSION = "4.1.0"          # bump this whenever you publish a new litebrowser4.py
 UPDATE_URL = ""                # direct link to the raw litebrowser4.py (e.g. a GitHub "Raw" link); or set it in the menu
 UPDATE_FILE = DATA / "litebrowser_update.py"   # used by the .exe build, which can't overwrite itself
 
@@ -127,6 +127,7 @@ if getattr(sys, "frozen", False) and __name__ == "__main__" and UPDATE_FILE.exis
 EXT_DIR = DATA / "extensions"
 LIST_FILE = DATA / "blocklist.txt"
 STATS_FILE = DATA / "stats.json"
+PW_FILE = DATA / "passwords.dat"           # saved logins, encrypted with your Windows account
 COOKIE_FILE = DATA / "cookies.json"       # our own copy of every cookie (see CookieJar)
 BM_FILE = DATA / "bookmarks.json"
 SESSION_FILE = DATA / "session.json"
@@ -781,6 +782,192 @@ class CookieJar(QObject):
         return len(self.jar)
 
 
+def _seal(txt):
+    """Encrypt text for the current Windows user (DPAPI); other systems keep it as plain text."""
+    if sys.platform == "win32":
+        try:
+            import base64
+            return "DPAPI1:" + base64.b64encode(_dpapi(txt.encode("utf-8"), True)).decode("ascii")
+        except Exception:
+            pass
+    return txt
+
+
+def _unseal(txt):
+    if txt.startswith("DPAPI1:"):
+        import base64
+        return _dpapi(base64.b64decode(txt[7:]), False).decode("utf-8")
+    return txt
+
+
+def pw_host(h):
+    h = (h or "").strip().lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+class PasswordStore:
+    """Saved logins. One encrypted file (passwords.dat). Matching is by site name, never by guesswork across sites."""
+
+    def __init__(self, path=None):
+        self.path = Path(path) if path else PW_FILE
+        self.items = []                # {"host","user","pw","ts"}
+        self.never = set()
+        self._load()
+
+    def _load(self):
+        try:
+            d = json.loads(_unseal(self.path.read_text(encoding="utf-8")))
+            self.items = [x for x in d.get("items", []) if isinstance(x, dict) and x.get("host") and x.get("pw")]
+            self.never = set(d.get("never", []))
+        except Exception:
+            self.items, self.never = [], set()
+
+    def save_file(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(_seal(json.dumps({"items": self.items, "never": sorted(self.never)})), encoding="utf-8")
+            os.replace(tmp, self.path)
+            return True
+        except Exception:
+            return False
+
+    def find(self, host):
+        """Logins for this site (newest first). A login saved for example.com also fits login.example.com."""
+        h = pw_host(host)
+        out = [x for x in self.items if h == x["host"] or h.endswith("." + x["host"])]
+        return sorted(out, key=lambda x: -x.get("ts", 0))
+
+    def status(self, host, user, pw):
+        """'new', 'update' (same user, other password) or 'same' (nothing to do)."""
+        h = pw_host(host)
+        for x in self.items:
+            if x["host"] == h and x["user"] == user:
+                return "same" if x["pw"] == pw else "update"
+        return "new"
+
+    def save(self, host, user, pw):
+        h = pw_host(host)
+        st = self.status(h, user, pw)
+        if st == "same":
+            return st
+        for x in self.items:
+            if x["host"] == h and x["user"] == user:
+                x["pw"], x["ts"] = pw, time.time()
+                break
+        else:
+            self.items.append({"host": h, "user": user, "pw": pw, "ts": time.time()})
+        self.save_file()
+        return st
+
+    def delete(self, item):
+        if item in self.items:
+            self.items.remove(item)
+            self.save_file()
+
+    def never_save(self, host):
+        self.never.add(pw_host(host))
+        self.save_file()
+
+    def is_never(self, host):
+        return pw_host(host) in self.never
+
+    def import_csv(self, text):
+        """Chrome / Brave / Edge / Firefox export format: columns url, username, password (name optional)."""
+        import csv
+        import io
+        from urllib.parse import urlsplit
+        n = 0
+        for row in csv.DictReader(io.StringIO(text.lstrip("\ufeff"))):
+            row = {(k or "").strip().lower(): (v or "") for k, v in row.items()}
+            url, user, pw = row.get("url", ""), row.get("username", ""), row.get("password", "")
+            host = urlsplit(url if "://" in url else "https://" + url).hostname or ""
+            if host and pw and self.status(host, user, pw) != "same":
+                self.save(host, user, pw)
+                n += 1
+        return n
+
+    def export_csv(self):
+        import csv
+        import io
+        buf = io.StringIO()
+        w = csv.writer(buf, lineterminator="\n")
+        w.writerow(["name", "url", "username", "password"])
+        for x in sorted(self.items, key=lambda x: x["host"]):
+            w.writerow([x["host"], "https://" + x["host"] + "/", x["user"], x["pw"]])
+        return buf.getvalue()
+
+
+PW_MARK = "__LB_PW__"
+# Runs in an isolated world (pages can't see or tamper with it), before the page's own scripts: it watches for a login being
+# submitted and reports user name + password to the browser through a console message that only our Page class reads.
+PW_CAPTURE_JS = r"""(function(){
+if(window.top!==window)return;
+var log=console.log.bind(console),sent='';
+function vis(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0}
+function fields(scope){return Array.prototype.slice.call(scope.querySelectorAll('input[type=text],input[type=email],input[type=tel],input:not([type])')).filter(vis)}
+function rememberUser(){try{var c=fields(document);for(var i=0;i<c.length;i++){if(c[i].value&&c[i].value.length<200){sessionStorage.setItem('__lb_user',c[i].value);return}}}catch(e){}}
+function grab(){
+  var pws=document.querySelectorAll('input[type=password]'),pw=null,i;
+  for(i=0;i<pws.length;i++){if(vis(pws[i])&&pws[i].value){pw=pws[i];break}}
+  if(!pw){rememberUser();return}
+  var u='',c=fields(pw.form||document);
+  for(i=0;i<c.length;i++){if(c[i].value&&(c[i].compareDocumentPosition(pw)&4))u=c[i].value}
+  if(!u){try{u=sessionStorage.getItem('__lb_user')||''}catch(e){}}
+  var key=u+'\u0000'+pw.value;if(key===sent)return;sent=key;
+  log('__LB_PW__'+JSON.stringify({u:u,p:pw.value}));
+}
+document.addEventListener('submit',grab,true);
+document.addEventListener('click',function(e){var t=e.target&&e.target.closest&&e.target.closest('button,input[type=submit],input[type=button],[role=button],a');if(t)grab()},true);
+document.addEventListener('keydown',function(e){if(e.key==='Enter')grab()},true);
+window.addEventListener('pagehide',grab);
+})();"""
+
+PW_FILL_JS = r"""(function(u,p){
+function vis(e){var r=e.getBoundingClientRect();return r.width>0&&r.height>0}
+var pws=Array.prototype.slice.call(document.querySelectorAll('input[type=password]')).filter(vis);
+if(!pws.length)return 0;
+var pw=pws[0];
+function set(el,v){if(el.value===v)return;
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,v);
+  el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}))}
+if(!pw.value)set(pw,p);
+var c=Array.prototype.slice.call((pw.form||document).querySelectorAll('input[type=text],input[type=email],input[type=tel],input:not([type])')).filter(vis),uel=null;
+for(var i=0;i<c.length;i++){if(c[i].compareDocumentPosition(pw)&4)uel=c[i]}
+if(uel&&!uel.value&&u)set(uel,u);
+return 1})(%s,%s)"""
+
+
+class EngineCheck(QObject):
+    """Is a newer PyQt6-WebEngine (= newer Chromium with security fixes) on PyPI?"""
+    result = pyqtSignal(str, str)          # installed, latest ("" if unknown)
+
+    @staticmethod
+    def newer(a, b):
+        def t(v):
+            return tuple(int(x) for x in re.findall(r"\d+", v)[:4])
+        try:
+            return t(b) > t(a)
+        except Exception:
+            return False
+
+    def run(self):
+        def work():
+            from importlib.metadata import version
+            from urllib.request import Request, urlopen
+            try:
+                cur = version("PyQt6-WebEngine")
+            except Exception:
+                cur = ""
+            try:
+                data = json.loads(urlopen(Request("https://pypi.org/pypi/PyQt6-WebEngine/json",
+                                                  headers={"User-Agent": "LiteBrowser"}), timeout=20).read())
+                self.result.emit(cur, str(data["info"]["version"]))
+            except Exception:
+                self.result.emit(cur, "")
+        threading.Thread(target=work, daemon=True).start()
+
+
 class SelfUpdater(QObject):
     """Checks UPDATE_URL for a newer litebrowser4.py and installs it (applied on next start)."""
     result = pyqtSignal(str, str)        # status: "new" | "same" | "error" | "off", detail
@@ -1218,7 +1405,11 @@ class Page(QWebEnginePage):
         self.browser = browser
 
     def javaScriptConsoleMessage(self, level, message, line, source):
-        pass                             # a site's own console output is not for the user (it used to flood the terminal)
+        if message.startswith(PW_MARK):  # our own login watcher (isolated world); everything else a site logs is ignored
+            try:
+                self.browser.on_pw_message(self, message[len(PW_MARK):])
+            except Exception:
+                pass
 
     def createWindow(self, _type):
         bg = _type == QWebEnginePage.WebWindowType.WebBrowserBackgroundTab     # ctrl/middle-click on a link
@@ -1815,6 +2006,26 @@ def chrome_profiles():
     return sorted(out, key=lambda x: (x["dir"] != "Default", x["dir"]))
 
 
+def other_browser_profiles():
+    """Profiles of Brave and Edge on this PC (same bookmark format as Chrome), for a one-click bookmark import."""
+    out = []
+    local = os.environ.get("LOCALAPPDATA")
+    if sys.platform != "win32" or not local:
+        return out
+    for label, rel in (("Brave", "BraveSoftware/Brave-Browser/User Data"), ("Edge", "Microsoft/Edge/User Data")):
+        base = Path(local) / rel
+        try:
+            cache = json.loads((base / "Local State").read_text(encoding="utf-8")).get("profile", {}).get("info_cache", {})
+        except Exception:
+            continue
+        for d, info in cache.items():
+            if (base / d / "Bookmarks").is_file():
+                nm = info.get("name") or d
+                out.append({"dir": f"{label.lower()}:{d}", "path": str(base / d), "email": "",
+                            "name": f"{label} - {nm}"})
+    return out
+
+
 def convert_chrome_node(n):
     t = n.get("type")
     if t == "url":
@@ -2370,6 +2581,171 @@ class HistoryWindow(QFrame):
             more.setCursor(Qt.CursorShape.PointingHandCursor)
             more.clicked.connect(lambda: (setattr(self, "limit", self.limit + 160), self.build()))
             self.cl.addWidget(more)
+        self.cl.addStretch(1)
+
+
+class PasswordsWindow(QFrame):
+    """Saved passwords: search, show / copy / delete, CSV import and export."""
+
+    def __init__(self, browser):
+        super().__init__(browser, Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setObjectName("settings")
+        self.b = browser
+        self._drag = None
+        self._shown = set()
+        self.resize(640, 700)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 20, 24, 22)
+        outer.setSpacing(10)
+        head = QHBoxLayout()
+        head.addWidget(QLabel("Passwords", objectName="settitle"))
+        head.addStretch(1)
+        x = HoverButton(objectName="flat")
+        x.setIcon(QIcon(pm_icon("close", width=4)))
+        x.setIconSize(QSize(16, 16))
+        x.setFixedSize(32, 32)
+        x.clicked.connect(self.close)
+        head.addWidget(x)
+        outer.addLayout(head)
+        self.search = QLineEdit(placeholderText="Search saved passwords")
+        self.search.setFixedHeight(38)
+        self.search.textChanged.connect(lambda _t: self.build())
+        outer.addWidget(self.search)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        for text, fn in (("Import CSV…", self._import), ("Export CSV…", self._export)):
+            c = HoverButton(objectName="chip")
+            c.setText(text)
+            c.setFixedHeight(30)
+            c.setCursor(Qt.CursorShape.PointingHandCursor)
+            c.clicked.connect(lambda _=False, f=fn: f())
+            actions.addWidget(c)
+        actions.addStretch(1)
+        outer.addLayout(actions)
+        self.note = QLabel("", objectName="extmeta")
+        outer.addWidget(self.note)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.content = QWidget()
+        self.cl = QVBoxLayout(self.content)
+        self.cl.setContentsMargins(0, 2, 4, 0)
+        self.cl.setSpacing(2)
+        scroll.setWidget(self.content)
+        outer.addWidget(scroll, 1)
+        self.build(animate=True)
+
+    def paintEvent(self, e):
+        paint_glass(self, 22)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        fade_in_window(self, 220, 14)
+        self.activateWindow()
+        self.search.setFocus()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(e)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and e.position().y() < 64:
+            self._drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and e.buttons() & Qt.MouseButton.LeftButton:
+            self.move(e.globalPosition().toPoint() - self._drag)
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
+        super().mouseReleaseEvent(e)
+
+    def _import(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import passwords (CSV from Chrome, Brave, Edge or Firefox)", "", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            n = self.b.pw.import_csv(Path(path).read_text(encoding="utf-8-sig"))
+            self.note.setText(f"Imported {n} password(s). Delete the CSV file now: it is not encrypted.")
+        except Exception as ex:
+            self.note.setText("Import failed: " + str(ex)[:80])
+        self.build()
+
+    def _export(self):
+        if QMessageBox.question(self, "Export passwords",
+                                "The CSV file will contain all your passwords as plain text. Anyone who gets the file can read them. Continue?"
+                                ) != QMessageBox.StandardButton.Yes:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export passwords", "litebrowser-passwords.csv", "CSV files (*.csv)")
+        if path:
+            try:
+                Path(path).write_text(self.b.pw.export_csv(), encoding="utf-8")
+                self.note.setText("Exported. Delete the file when you are done with it.")
+            except Exception as ex:
+                self.note.setText("Export failed: " + str(ex)[:80])
+
+    def _copy(self, item):
+        cb = QApplication.clipboard()
+        cb.setText(item["pw"])
+        pw = item["pw"]
+        QTimer.singleShot(30000, lambda: cb.text() == pw and cb.clear())     # the clipboard forgets it after 30 s
+        self.note.setText(f"Password for {item['host']} copied (cleared from the clipboard in 30 s).")
+
+    def _toggle(self, item):
+        self._shown.symmetric_difference_update({id(item)})
+        self.build()
+
+    def _delete(self, item):
+        self.b.pw.delete(item)
+        self.build()
+
+    def build(self, animate=False):
+        while self.cl.count():
+            w = self.cl.takeAt(0).widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        q = self.search.text().strip().lower()
+        items = [x for x in sorted(self.b.pw.items, key=lambda x: (x["host"], x["user"]))
+                 if not q or q in x["host"] or q in x["user"].lower()]
+        if not items:
+            self.cl.addWidget(QLabel("No matches." if q else "No saved passwords yet. When you sign in somewhere, LiteBrowser offers to save it.",
+                                     objectName="extmuted"))
+        for i, it in enumerate(items):
+            row = HoverRow(base=0, hi=22, radius=12)
+            h = QHBoxLayout(row)
+            h.setContentsMargins(12, 8, 8, 8)
+            h.setSpacing(8)
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            col.addWidget(QLabel(it["host"], objectName="extname"))
+            shown = id(it) in self._shown
+            col.addWidget(QLabel((it["user"] or "(no user name)") + "   ·   " + (it["pw"] if shown else "•" * 10), objectName="extmeta"))
+            h.addLayout(col, 1)
+            for text, fn in (("Hide" if shown else "Show", lambda it=it: self._toggle(it)), ("Copy", lambda it=it: self._copy(it))):
+                c = HoverButton(objectName="chip")
+                c.setText(text)
+                c.setFixedHeight(28)
+                c.setCursor(Qt.CursorShape.PointingHandCursor)
+                c.clicked.connect(lambda _=False, f=fn: f())
+                h.addWidget(c)
+            rm = HoverButton(objectName="flat")
+            rm.setIcon(QIcon(pm_icon("trash", "#ff9aa5", width=3.2)))
+            rm.setIconSize(QSize(16, 16))
+            rm.setFixedSize(30, 30)
+            rm.setToolTip("Delete this password")
+            rm.clicked.connect(lambda _=False, it=it: self._delete(it))
+            h.addWidget(rm)
+            self.cl.addWidget(row)
+            if animate and i < 14:
+                fade_widget(row, delay=60 + i * 30)
         self.cl.addStretch(1)
 
 
@@ -3138,6 +3514,7 @@ class Browser(QMainWindow):
         self._settings = None
         self._gwin = None
         self._hwin = None
+        self._pwin = None
         self._devtools = None
         self.gsync = load_gsync()
         self._queue, self._batch_ids, self._batch_ok, self._batch_fail, self._installing = [], set(), 0, 0, False
@@ -3173,6 +3550,18 @@ class Browser(QMainWindow):
         self.profile.downloadRequested.connect(self.on_download)
         self.cookies = CookieJar(self.profile.cookieStore(), self)      # our own copy of all cookies (keeps you signed in)
         self.cookies.restore()
+        self._notifs = []
+        self._tray = None
+        try:
+            self.profile.setNotificationPresenter(self.present_notification)
+        except Exception:
+            pass
+        self.engine = EngineCheck()
+        self.engine.result.connect(self.on_engine_checked)
+        self._engine_new = ""
+        self.pw = PasswordStore()
+        self.pw_on = load_json(PREFS_FILE, {}).get("pw_offer", True)
+        self._pw_pending = None
         s = self.profile.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
         s.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False)
@@ -3225,6 +3614,14 @@ class Browser(QMainWindow):
             "}catch(e){}})();" % ("true" if self.passkeys_on else "false"))
         if BLOCK_CONDITIONAL_PASSKEYS:
             self.profile.scripts().insert(self.webauthn_js)
+        self.pw_js = QWebEngineScript()                   # watches for a login being submitted (offers to save it)
+        self.pw_js.setName("pw-capture")
+        self.pw_js.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        self.pw_js.setWorldId(QWebEngineScript.ScriptWorldId.ApplicationWorld)
+        self.pw_js.setRunsOnSubFrames(False)
+        self.pw_js.setSourceCode(PW_CAPTURE_JS)
+        if self.pw_on:
+            self.profile.scripts().insert(self.pw_js)
         self.signin_js = QWebEngineScript()               # makes the page's own view of the browser match the header
         self.signin_js.setName("signin-compat")
         self.signin_js.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
@@ -3414,6 +3811,17 @@ class Browser(QMainWindow):
         col.addWidget(self.defwrap)
         self.def_col = Collapser(self.defwrap, 46, shown=False)
 
+        self.pwwrap, self.pw_label, self.pw_btn = self._make_infobar(
+            "lock", "Save", self._pw_save, self._pw_dismiss)          # offer to save a password after signing in
+        never = HoverButton(objectName="chip")
+        never.setText("Never for this site")
+        never.setFixedHeight(28)
+        never.setCursor(Qt.CursorShape.PointingHandCursor)
+        never.clicked.connect(self._pw_never)
+        self.pwwrap.findChild(QFrame, "storepill").layout().insertWidget(3, never)
+        col.addWidget(self.pwwrap)
+        self.pw_col = Collapser(self.pwwrap, 46, shown=False)
+
         self.permwrap, self.perm_label, self.perm_btn = self._make_infobar(
             "lock", "Allow", self._perm_allow, self._perm_deny)       # site asks for camera / microphone / location
         col.addWidget(self.permwrap)
@@ -3511,6 +3919,7 @@ class Browser(QMainWindow):
         QTimer.singleShot(2500, self.auto_sync)
         QTimer.singleShot(3500, self.ensure_shortcut)
         QTimer.singleShot(9000, self.auto_check_updates)
+        QTimer.singleShot(20000, self.auto_engine_check)
         gt = QTimer(self)
         gt.timeout.connect(self.auto_sync)
         gt.start(30 * 60 * 1000)
@@ -3576,7 +3985,7 @@ class Browser(QMainWindow):
     def closeEvent(self, e):
         self.save_session()
         self.history.flush()
-        for w in (self._settings, self._gwin, self._hwin, self._panel, self._devtools, getattr(self, "sug", None)):
+        for w in (self._settings, self._gwin, self._hwin, self._pwin, self._panel, self._devtools, getattr(self, "sug", None)):
             try:
                 if w is not None:
                     w.close()
@@ -3849,6 +4258,8 @@ class Browser(QMainWindow):
         page.windowCloseRequested.connect(lambda v=v: self.close_by_page(v))
         if QWebEnginePermission is not None and hasattr(page, "permissionRequested"):
             page.permissionRequested.connect(self.on_permission)
+        if hasattr(page, "desktopMediaRequested"):              # screen / window sharing (Meet, Teams, Discord ...)
+            page.desktopMediaRequested.connect(self.on_desktop_media)
         v.setPage(page)
         page.setBackgroundColor(QColor("#12030a"))
         self.stack.addWidget(v)
@@ -4004,6 +4415,14 @@ class Browser(QMainWindow):
 
     # --- history / address-bar suggestions ---------------------------------------------
     def on_loaded(self, v, ok):
+        try:
+            p = self._pw_pending
+            if p and p.get("view") is v:
+                self._pw_show()                            # the login went through (a new page loaded): now offer to save it
+            if ok:
+                self._pw_autofill(v)
+        except Exception:
+            pass
         pt = self._pending_typed
         if pt is not None and pt[0] == id(v):
             self._pending_typed = None
@@ -4199,8 +4618,8 @@ class Browser(QMainWindow):
     def on_permission(self, perm):
         try:
             T = QWebEnginePermission.PermissionType
-            if perm.permissionType() in (getattr(T, "Notifications", None), getattr(T, "Unsupported", None)):
-                perm.deny()                           # we have no notification UI: don't let sites wait forever
+            if perm.permissionType() == getattr(T, "Unsupported", None):
+                perm.deny()
                 return
             self._perm_q.append(perm)
             if len(self._perm_q) == 1:
@@ -4216,7 +4635,8 @@ class Browser(QMainWindow):
         names = {"MediaAudioCapture": "use your microphone", "MediaVideoCapture": "use your camera",
                  "MediaAudioVideoCapture": "use your camera and microphone", "Geolocation": "know your location",
                  "DesktopVideoCapture": "share your screen", "DesktopAudioVideoCapture": "share your screen and sound",
-                 "ClipboardReadWrite": "read your clipboard", "MouseLock": "lock your mouse pointer"}
+                 "ClipboardReadWrite": "read your clipboard", "MouseLock": "lock your mouse pointer",
+                 "Notifications": "show notifications"}
         for n, text in names.items():
             if t == getattr(T, n, object()):
                 return text
@@ -4404,6 +4824,198 @@ class Browser(QMainWindow):
         self.tick()
         self.toast("Ad blocker " + ("on" if self.adblock.enabled else "off") + " (reload the page)")
 
+    # --- notifications, screen sharing ---------------------------------------------------
+    def present_notification(self, n):
+        try:
+            n.show()                                   # tells the page the notification was displayed
+            self._notifs.append(n)
+            del self._notifs[:-20]
+            title, msg = n.title(), n.message()
+            host = ""
+            try:
+                host = n.origin().host()
+            except Exception:
+                pass
+            if self._tray is None and QSystemTrayIcon.isSystemTrayAvailable():
+                self._tray = QSystemTrayIcon(QIcon(make_app_icon(64)), self)
+                self._tray.messageClicked.connect(self._notif_clicked)
+                self._tray.setToolTip("LiteBrowser")
+                self._tray.show()
+            if self._tray is not None:
+                self._tray.showMessage(f"{title}" + (f"  ·  {host}" if host else ""), msg[:240],
+                                       QSystemTrayIcon.MessageIcon.NoIcon, 7000)
+            else:
+                self.toast(f"{host}: {title}"[:80])
+        except Exception:
+            pass
+
+    def _notif_clicked(self):
+        try:
+            self.showNormal() if self.isMinimized() else self.show()
+            self.raise_()
+            self.activateWindow()
+            if self._notifs:
+                self._notifs[-1].click()
+        except Exception:
+            pass
+
+    def on_desktop_media(self, req):
+        """The page wants to share a screen or window: let the user choose which."""
+        chosen = []
+        try:
+            m = glass_menu(self)
+            sm, wm = req.screensModel(), req.windowsModel()
+            for i in range(sm.rowCount()):
+                idx = sm.index(i, 0)
+                m.addAction("Screen: " + str(idx.data()), lambda idx=idx: (chosen.append(1), req.selectScreen(idx)))
+            if wm.rowCount():
+                m.addSeparator()
+            for i in range(min(wm.rowCount(), 25)):
+                idx = wm.index(i, 0)
+                m.addAction("Window: " + str(idx.data())[:60], lambda idx=idx: (chosen.append(1), req.selectWindow(idx)))
+            m.exec(QCursor.pos())
+        except Exception:
+            pass
+        if not chosen:
+            try:
+                req.cancel()
+            except Exception:
+                pass
+
+    # --- engine (Chromium) security updates ------------------------------------------------
+    def auto_engine_check(self):
+        if "--bench-out" in sys.argv:
+            return
+        prefs = load_json(PREFS_FILE, {})
+        if time.time() - prefs.get("last_engine_check", 0) < 7 * 86400:
+            return
+        prefs["last_engine_check"] = time.time()
+        save_json(PREFS_FILE, prefs)
+        self.engine.run()
+
+    def on_engine_checked(self, cur, latest):
+        if latest and cur and EngineCheck.newer(cur, latest):
+            self._engine_new = latest
+            self.toast(f"A newer browser engine ({latest}) has security fixes - menu > Update engine")
+
+    def chromium_version(self):
+        try:
+            m = re.search(r"Chrome/(\d+)", str(self.profile.httpUserAgent()))
+            return m.group(1) if m else "?"
+        except Exception:
+            return "?"
+
+    def update_engine(self):
+        if getattr(sys, "frozen", False):
+            QMessageBox.information(self, "Update engine", "This is the .exe build: rebuild it with build_exe.bat to get a newer engine.")
+            return
+        if QMessageBox.question(self, "Update browser engine",
+                                "LiteBrowser will close, install the newest PyQt6 / PyQt6-WebEngine (a newer Chromium) with pip, and "
+                                "reopen by itself. This can take a minute or two. Continue?") != QMessageBox.StandardButton.Yes:
+            return
+        py = sys.executable
+        me = str(Path(__file__).resolve())
+        log = str(DATA / "engine_update.log")
+        code = ("import time,subprocess,sys;time.sleep(3);py,me,log=sys.argv[1:4];f=open(log,'ab');"
+                "subprocess.run([py,'-m','pip','install','-U','PyQt6','PyQt6-WebEngine'],stdout=f,stderr=f);"
+                "subprocess.Popen([py,me])")
+        try:
+            subprocess.Popen([py, "-c", code, py, me, log],
+                             creationflags=0x08000000 if sys.platform == "win32" else 0)
+        except Exception as e:
+            self.toast("Could not start the update: " + str(e)[:50])
+            return
+        self.close()
+        QApplication.quit()
+
+    # --- password manager --------------------------------------------------------------
+    PW_WORLD = getattr(getattr(QWebEngineScript.ScriptWorldId, "ApplicationWorld", 1), "value", 1)
+
+    def on_pw_message(self, page, payload):
+        if not self.pw_on:
+            return
+        d = json.loads(payload)
+        user, pw = str(d.get("u", ""))[:256], str(d.get("p", ""))[:512]
+        u = page.url()
+        host = pw_host(u.host())               # the site comes from the page itself, never from what the page claims
+        if not pw or not host or u.scheme() not in ("http", "https") or self.pw.is_never(host):
+            return
+        st = self.pw.status(host, user, pw)
+        if st == "same":
+            return
+        self._pw_pending = {"view": page.view(), "host": host, "user": user, "pw": pw, "state": st}
+        QTimer.singleShot(3500, self._pw_show)        # (also shown right when the next page has loaded)
+
+    def _pw_show(self):
+        p = self._pw_pending
+        if not p or p.get("shown"):
+            return
+        p["shown"] = True
+        who = f" for {p['user']}" if p["user"] else ""
+        verb = "Update" if p["state"] == "update" else "Save"
+        self.pw_label.setText(f"{verb} password{who} on {p['host']}?")
+        self.pw_btn.setText(verb)
+        self.pw_col.set(True)
+
+    def _pw_save(self):
+        p, self._pw_pending = self._pw_pending, None
+        self.pw_col.set(False)
+        if p:
+            self.pw.save(p["host"], p["user"], p["pw"])
+            self.toast(f"Password saved for {p['host']}")
+
+    def _pw_never(self):
+        p, self._pw_pending = self._pw_pending, None
+        self.pw_col.set(False)
+        if p:
+            self.pw.never_save(p["host"])
+            self.toast(f"Won't offer to save passwords on {p['host']}")
+
+    def _pw_dismiss(self):
+        self._pw_pending = None
+        self.pw_col.set(False)
+
+    def _pw_autofill(self, v):
+        if not self.pw_on or not self.pw.items:
+            return
+        u = v.url()
+        host = u.host()
+        if u.scheme() != "https" and host not in ("localhost", "127.0.0.1"):
+            return                                     # never fill a password into an unencrypted page
+        found = self.pw.find(host)
+        if not found:
+            return
+        code = PW_FILL_JS % (json.dumps(found[0]["user"]), json.dumps(found[0]["pw"]))
+        for delay in (0, 700, 2200):                    # also catches logins that appear a moment after the page loaded
+            QTimer.singleShot(delay, lambda v=v, code=code, host=host: self._pw_run(v, code, host))
+
+    def _pw_run(self, v, code, host):
+        try:
+            if v.url().host() == host:
+                v.page().runJavaScript(code, self.PW_WORLD)
+        except RuntimeError:
+            pass
+
+    def toggle_pw_offer(self):
+        prefs = load_json(PREFS_FILE, {})
+        prefs["pw_offer"] = not self.pw_on
+        save_json(PREFS_FILE, prefs)
+        self.toast("Password saving " + ("turned on" if not self.pw_on else "turned off") + " - restart to apply")
+
+    def show_passwords(self):
+        try:
+            if self._pwin is not None:
+                self._pwin.close()
+                return
+        except RuntimeError:
+            self._pwin = None
+        w = PasswordsWindow(self)
+        w.destroyed.connect(lambda *_, x=w: setattr(self, "_pwin", None) if self._pwin is x else None)
+        g = self.geometry()
+        w.move(g.center().x() - w.width() // 2, g.center().y() - w.height() // 2)
+        self._pwin = w
+        w.show()
+
     def toggle_passkeys(self):
         prefs = load_json(PREFS_FILE, {})
         prefs["passkeys"] = not self.passkeys_on
@@ -4532,6 +5144,10 @@ class Browser(QMainWindow):
         rt.triggered.connect(self.toggle_restore)
         m.addAction(rt)
         m.addAction("History", self.show_history)
+        m.addAction(f"Passwords  ({len(self.pw.items)} saved)", self.show_passwords)
+        a = QAction("Offer to save & fill passwords", m, checkable=True, checked=self.pw_on)
+        a.triggered.connect(self.toggle_pw_offer)
+        m.addAction(a)
         m.addAction(f"Saved sign-ins: {self.cookies.count():,} cookies kept").setEnabled(False)
         dm = GlassMenu("Downloads", m)
         m.addMenu(dm)
@@ -4553,6 +5169,7 @@ class Browser(QMainWindow):
                     checkable=True, checked=self.adblock.enabled)
         a.triggered.connect(self.toggle_adblock)
         m.addAction(a)
+        m.addAction("Import bookmarks from Brave / Edge", self.import_other_bookmarks)
         m.addAction("Update blocklist", self.updater.run)
         a = QAction("Allow passkeys / security keys (only after you click)", m, checkable=True, checked=self.passkeys_on)
         a.triggered.connect(self.toggle_passkeys)
@@ -4561,6 +5178,8 @@ class Browser(QMainWindow):
             m.addAction(f"Restart now  (v{self._update_ready} is ready)", self.restart_now)
         m.addAction(f"Check for browser updates  (v{APP_VERSION})", lambda: self.check_updates(True))
         m.addAction("Auto-update source...", self.set_update_source)
+        m.addAction(f"Update browser engine  (Chromium {self.chromium_version()}"
+                    + (f", {self._engine_new} available)" if self._engine_new else ")"), self.update_engine)
         m.addAction("Reset blocking stats", self.reset_stats)
         cv0 = self.cur()
         h0 = self._site_key(cv0.url().host()) if cv0 is not None else ""
@@ -4837,6 +5456,20 @@ class Browser(QMainWindow):
             self.bm["items"].append(folder)
             self.save_bm()
         return sum(1 for _ in bm_walk(folder["children"]))
+
+    def import_other_bookmarks(self):
+        profs = other_browser_profiles()
+        if not profs:
+            self.toast("No Brave or Edge profile with bookmarks found")
+            return
+        n = 0
+        for pr in profs:
+            f = build_account_folder(pr)
+            if f is not None:
+                n += self.apply_account_folder(f, pr)
+        self.refresh_bookmarks()
+        self.update_star()
+        self.toast(f"Imported {n} bookmarks from {len(profs)} Brave/Edge profile(s)")
 
     def sync_bookmarks_from(self, prof):
         folder = build_account_folder(prof)
