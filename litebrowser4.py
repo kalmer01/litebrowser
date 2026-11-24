@@ -70,14 +70,14 @@ try:
 except ImportError:                      # Qt older than 6.8: no permission prompts
     QWebEnginePermission = None
 from PyQt6.QtWidgets import (QAbstractButton, QApplication, QGraphicsOpacityEffect, QScrollArea, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-                             QFrame, QMainWindow, QMenu, QProgressBar, QPushButton, QStackedWidget, QTabBar,
+                             QFrame, QMainWindow, QMenu, QProgressBar, QStackedWidget, QTabBar,
                              QToolButton, QVBoxLayout, QWidget)
 
 DATA = Path(os.environ.get("LITEBROWSER_DATA") or (Path.home() / ".litebrowser"))   # benchmark.py points this at a temp folder
 _mark("imports_done")
 
 # ---------------------------------------------------------------- self-update (single file)
-APP_VERSION = "4.0.5"          # bump this whenever you publish a new litebrowser4.py
+APP_VERSION = "4.0.6"          # bump this whenever you publish a new litebrowser4.py
 UPDATE_URL = ""                # direct link to the raw litebrowser4.py (e.g. a GitHub "Raw" link); or set it in the menu
 UPDATE_FILE = DATA / "litebrowser_update.py"   # used by the .exe build, which can't overwrite itself
 
@@ -1737,7 +1737,7 @@ def guess_url(text):
     t = (text or "").strip().strip('"')
     if not t:
         return ""
-    if os.path.exists(t):
+    if (os.path.isabs(t) or "\\" in t or "/" in t or t.startswith(".")) and os.path.exists(t):
         return QUrl.fromLocalFile(os.path.abspath(t)).toString()
     if "://" in t or t.startswith(("about:", "chrome:", "data:", "file:", "view-source:")):
         return t
@@ -2755,6 +2755,7 @@ class TabBar(QTabBar):
             b = self.tabButton(i, QTabBar.ButtonPosition.RightSide)
             if b is not None and not isinstance(b, CloseSlot):
                 self.setTabButton(i, QTabBar.ButtonPosition.RightSide, CloseSlot())
+                b.deleteLater()
         self._apply_close()
         self.refit(True)
 
@@ -3992,6 +3993,13 @@ class Browser(QMainWindow):
             self._active = None
         self.stack.removeWidget(d)
         self.last_active.pop(d, None)
+        try:                                   # the page is owned by the window, so without this a closed tab's
+            pg = d.page()                      # renderer process and memory would stay alive until the browser quits
+            d.setPage(None)
+            if pg is not None:
+                pg.deleteLater()
+        except Exception:
+            pass
         d.deleteLater()
 
     # --- history / address-bar suggestions ---------------------------------------------
@@ -4007,7 +4015,8 @@ class Browser(QMainWindow):
         if not ok or getattr(v, "is_start", False):
             return
         u = v.url()
-        if u.scheme() in ("http", "https"):
+        if u.scheme() in ("http", "https") and u.host() not in SIGNIN_HOSTS and not re.search(
+                r"[?&#](access_token|id_token|token|code|password|auth|session)=", u.toString(), re.I):
             self.history.visit(u.toString(), v.title())
 
     def show_history(self):
