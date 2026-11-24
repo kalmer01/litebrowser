@@ -77,7 +77,7 @@ DATA = Path(os.environ.get("LITEBROWSER_DATA") or (Path.home() / ".litebrowser")
 _mark("imports_done")
 
 # ---------------------------------------------------------------- self-update (single file)
-APP_VERSION = "4.1.0"          # bump this whenever you publish a new litebrowser4.py
+APP_VERSION = "4.2.0"          # bump this whenever you publish a new litebrowser4.py
 UPDATE_URL = ""                # direct link to the raw litebrowser4.py (e.g. a GitHub "Raw" link); or set it in the menu
 UPDATE_FILE = DATA / "litebrowser_update.py"   # used by the .exe build, which can't overwrite itself
 
@@ -532,6 +532,7 @@ DEFAULT_COST = (15_000, 60)
 
 class AdBlock(QWebEngineUrlRequestInterceptor):
     """Blocks sub-resource requests to ad/tracker domains (never the page itself)."""
+    guard = None
 
     def __init__(self):
         super().__init__()
@@ -598,6 +599,9 @@ class AdBlock(QWebEngineUrlRequestInterceptor):
                 info.setHttpHeader(b"User-Agent", FIREFOX_UA.encode())
             except Exception:
                 pass
+            return
+        if self.guard is not None and info.resourceType() != R.ResourceTypeMainFrame and self.guard.bad_host(host.lower()):
+            info.block(True)                    # malware hosts are blocked even when the ad blocker is off
             return
         if not self.enabled:
             return
@@ -938,6 +942,263 @@ if(uel&&!uel.value&&u)set(uel,u);
 return 1})(%s,%s)"""
 
 
+# ------------------------------------------------------------------------------------------------
+# Safety: known-bad sites, look-alike addresses, HTTPS-first, Windows Hello gate, download checks
+# ------------------------------------------------------------------------------------------------
+THREAT_FILE = DATA / "threats.txt"
+THREAT_FEEDS = (("https://openphish.com/feed.txt", "u"), ("https://urlhaus.abuse.ch/downloads/hostfile/", "h"))
+SHARED_DOMAINS = {"github.io", "githubusercontent.com", "googleusercontent.com", "google.com", "docs.google.com", "blogspot.com",
+                  "wordpress.com", "weebly.com", "wixsite.com", "netlify.app", "vercel.app", "pages.dev", "web.app",
+                  "firebaseapp.com", "herokuapp.com", "azurewebsites.net", "amazonaws.com", "cloudfront.net", "workers.dev",
+                  "notion.site", "sites.google.com", "dropbox.com", "onedrive.live.com", "sharepoint.com", "typeform.com",
+                  "canva.com", "medium.com", "tumblr.com", "000webhostapp.com", "ipfs.io", "r2.dev", "glitch.me", "repl.co"}
+BRANDS = {
+    "google": {"google.com", "gmail.com", "youtube.com", "goog.le"}, "microsoft": {"microsoft.com", "live.com", "office.com", "outlook.com", "microsoftonline.com"},
+    "apple": {"apple.com", "icloud.com"}, "amazon": {"amazon.com", "amazon.de", "amazon.co.uk"}, "paypal": {"paypal.com"},
+    "netflix": {"netflix.com"}, "facebook": {"facebook.com", "fb.com"}, "instagram": {"instagram.com"}, "whatsapp": {"whatsapp.com"},
+    "github": {"github.com"}, "discord": {"discord.com", "discord.gg"}, "roblox": {"roblox.com"}, "steam": {"steampowered.com", "steamcommunity.com"},
+    "binance": {"binance.com"}, "coinbase": {"coinbase.com"}, "revolut": {"revolut.com"}, "swedbank": {"swedbank.ee", "swedbank.com", "swedbank.se"},
+    "lhv": {"lhv.ee", "lhv.com"}, "wise": {"wise.com"}, "stripe": {"stripe.com"}, "dropbox": {"dropbox.com"}, "linkedin": {"linkedin.com"},
+    "telegram": {"telegram.org", "t.me"}, "twitter": {"twitter.com", "x.com"}, "ebay": {"ebay.com"}, "adobe": {"adobe.com"},
+    "spotify": {"spotify.com"}, "twitch": {"twitch.tv"}, "tiktok": {"tiktok.com"}, "kraken": {"kraken.com"}, "metamask": {"metamask.io"},
+}
+RISKY_TLDS = {"tk", "ml", "ga", "cf", "gq", "xyz", "top", "click", "zip", "mov", "icu", "buzz", "monster", "cyou", "rest", "work", "support"}
+DANGEROUS_EXT = {".exe", ".msi", ".bat", ".cmd", ".com", ".scr", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta", ".jar",
+                 ".lnk", ".reg", ".dll", ".cpl", ".msc", ".pif", ".appx", ".msix", ".msp", ".iso", ".img", ".vhd", ".docm", ".xlsm",
+                 ".pptm", ".chm", ".application", ".gadget", ".scf", ".url"}
+_RESERVED = {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+
+
+def safe_filename(name):
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or "")).strip(" .") or "download"
+    if name.split(".")[0].lower() in _RESERVED:
+        name = "_" + name
+    return name[:150]
+
+
+def reg_domain(host):
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    if len(parts[-1]) == 2 and parts[-2] in ("co", "com", "org", "net", "gov", "ac", "edu"):
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def _edit1(a, b):
+    """True if a and b differ by exactly one insert, delete or substitution."""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    if len(a) > len(b):
+        a, b = b, a
+    for i in range(len(b)):
+        if b[:i] + b[i + 1:] == a:
+            return True
+    return False
+
+
+def _is_private_host(host):
+    if not host or host == "localhost" or "." not in host or host.endswith((".local", ".lan", ".internal", ".home", ".localdomain")):
+        return True
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)\.(\d+)", host)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return a in (10, 127) or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31) or (a == 169 and b == 254)
+    return ":" in host      # IPv6 literal
+
+
+def mark_of_the_web(path):
+    """Tell Windows (SmartScreen, Office) that a file came from the internet."""
+    if sys.platform != "win32":
+        return
+    try:
+        with open(str(path) + ":Zone.Identifier", "w", encoding="ascii") as f:
+            f.write("[ZoneTransfer]\r\nZoneId=3\r\n")
+    except Exception:
+        pass
+
+
+class Guard:
+    """Decides whether a page address is known-bad, suspicious (look-alike) or fine. No network in verdict()."""
+
+    def __init__(self):
+        self.mal_hosts = set()     # URLhaus: hosts serving malware
+        self.ph_hosts = set()      # OpenPhish hosts on their own domains
+        self.ph_urls = set()       # OpenPhish exact pages (host + path)
+        self.allowed = set()       # hosts the user chose to open anyway (this session only)
+        self.http_ok = set()       # hosts the user chose to open over plain http (this session only)
+        self.https_first = True
+        self.loaded = False
+        self.load()
+
+    def load(self):
+        try:
+            mh, ph, pu = set(), set(), set()
+            for line in THREAT_FILE.read_text(encoding="utf-8").splitlines():
+                k, _, v = line.partition(" ")
+                if k == "m":
+                    mh.add(v)
+                elif k == "p":
+                    ph.add(v)
+                elif k == "u":
+                    pu.add(v)
+            self.mal_hosts, self.ph_hosts, self.ph_urls, self.loaded = mh, ph, pu, bool(mh or ph or pu)
+        except Exception:
+            pass
+
+    def count(self):
+        return len(self.mal_hosts) + len(self.ph_hosts) + len(self.ph_urls)
+
+    def refresh(self, force=False):
+        try:
+            if not force and THREAT_FILE.exists() and time.time() - THREAT_FILE.stat().st_mtime < 20 * 3600:
+                return
+        except Exception:
+            pass
+
+        def work():
+            from urllib.request import Request, urlopen
+            from urllib.parse import urlsplit
+            out, got = [], 0
+            for url, kind in THREAT_FEEDS:
+                try:
+                    raw = urlopen(Request(url, headers={"User-Agent": "LiteBrowser"}), timeout=30).read(12_000_000).decode("utf-8", "ignore")
+                except Exception:
+                    continue
+                got += 1
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if kind == "h":
+                        h = line.split()[-1].lower()
+                        if "." in h and not _is_private_host(h):
+                            out.append("m " + h)
+                    else:
+                        try:
+                            u = urlsplit(line)
+                            h = (u.hostname or "").lower()
+                        except Exception:
+                            continue
+                        if not h:
+                            continue
+                        if reg_domain(h) in SHARED_DOMAINS or h in SHARED_DOMAINS:
+                            out.append("u " + h + (u.path or "/").rstrip("/"))
+                        else:
+                            out.append("p " + h)
+            if got and out:
+                try:
+                    DATA.mkdir(parents=True, exist_ok=True)
+                    tmp = THREAT_FILE.with_suffix(".tmp")
+                    tmp.write_text("\n".join(out), encoding="utf-8")
+                    os.replace(tmp, THREAT_FILE)
+                    self.load()
+                except Exception:
+                    pass
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _parents(host):
+        while host:
+            yield host
+            host = host.partition(".")[2]
+
+    def bad_host(self, host):
+        """Cheap check used for every sub-resource: hosts known to serve malware."""
+        return bool(self.mal_hosts) and any(h in self.mal_hosts for h in self._parents(host))
+
+    def verdict(self, url):
+        """None if fine, else (level, title, why) with level 'block' (known bad) or 'warn' (looks suspicious)."""
+        from urllib.parse import urlsplit
+        try:
+            u = urlsplit(url)
+            host = (u.hostname or "").lower().rstrip(".")
+        except Exception:
+            return None
+        if u.scheme not in ("http", "https") or not host or _is_private_host(host):
+            return None
+        if any(h in self.allowed for h in self._parents(host)):
+            return None
+        if self.bad_host(host):
+            return ("block", "Dangerous site", "This address is on a list of sites that spread malware.")
+        if any(h in self.ph_hosts for h in self._parents(host)) or (host + (u.path or "/").rstrip("/")) in self.ph_urls:
+            return ("block", "Phishing page", "This address is on a list of fake pages that steal passwords and money.")
+        if "@" in (u.netloc or ""):
+            return ("warn", "Misleading address", "The address contains a hidden username (name@site). That trick is used to make a fake site look real.")
+        try:
+            uni = host.encode("ascii").decode("idna") if "xn--" in host else host
+        except Exception:
+            uni = host
+        if uni != host:
+            import unicodedata
+            scripts = set()
+            for ch in uni:
+                if ch.isalpha():
+                    scripts.add(unicodedata.name(ch, "X").split()[0])
+            if len(scripts) > 1 or (scripts and scripts != {"LATIN"}):
+                return ("warn", "Look-alike address", "The address uses unusual characters that can imitate a well-known site: " + uni)
+        rd = reg_domain(host)
+        name, _, tld = rd.partition(".")
+        tld = tld.rsplit(".", 1)[-1]
+        labels = host.split(".")
+        for brand, good in BRANDS.items():
+            if rd in good or any(rd.endswith("." + g) for g in good):
+                continue
+            if brand in labels[:-1] and name != brand:
+                return ("warn", "Possible fake site", f"This is not {brand.title()}'s real address, but it contains the name '{brand}'.")
+            if name.startswith(brand + "-") or name.endswith("-" + brand) or (name == brand and tld in RISKY_TLDS):
+                return ("warn", "Possible fake site", f"This looks like it is pretending to be {brand.title()}.")
+            if len(brand) >= 6 and _edit1(name, brand):
+                return ("warn", "Possible fake site", f"The address is one letter away from {brand.title()}. Check the spelling.")
+        return None
+
+    def should_upgrade(self, host):
+        host = (host or "").lower()
+        return self.https_first and not _is_private_host(host) and not any(h in self.http_ok for h in self._parents(host))
+
+
+def warning_html(title, why, url, kind):
+    import html as _h
+    from urllib.parse import quote
+    u = _h.escape(url, quote=True)
+    go = "lbhttp:" if kind == "http" else "lbgo:"
+    label = "Open over insecure http anyway" if kind == "http" else "I understand the risk, continue"
+    col = "#ff5a6a" if kind == "block" else "#ffb454"
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{_h.escape(title)}</title><style>
+html,body{{height:100%;margin:0;background:#1a0509;color:#f6e9ec;font:16px/1.55 'Segoe UI',system-ui,sans-serif}}
+main{{max-width:620px;margin:0 auto;padding:12vh 24px 0}}
+h1{{font-size:28px;margin:0 0 10px;color:{col}}} p{{color:#d9c3c8}}
+code{{display:block;background:#2b0b12;border:1px solid #5a1a26;border-radius:10px;padding:10px 14px;margin:18px 0;word-break:break-all;color:#fff}}
+a.b{{display:inline-block;margin:6px 10px 0 0;padding:10px 20px;border-radius:12px;text-decoration:none;font-weight:600}}
+a.safe{{background:#c5283d;color:#fff}} a.risk{{border:1px solid #6b2a36;color:#bca0a6}}
+</style></head><body><main><h1>{_h.escape(title)}</h1><p>{_h.escape(why)}</p><code>{u}</code>
+<a class="b safe" href="lbback:">Go back to safety</a><a class="b risk" href="{go}{quote(url, safe='')}">{label}</a></main></body></html>"""
+
+
+class OsVerify(QObject):
+    """Windows Hello / PIN / fingerprint check before the passwords are shown (runs PowerShell in the background)."""
+    result = pyqtSignal(str)
+    PS = ("$ErrorActionPreference='Stop';"
+          "Add-Type -AssemblyName System.Runtime.WindowsRuntime;"
+          "$null=[Windows.Security.Credentials.UI.UserConsentVerifier,Windows.Security.Credentials.UI,ContentType=WindowsRuntime];"
+          "$m=([System.WindowsRuntimeSystemExtensions].GetMethods()|Where-Object{$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'})[0];"
+          "$t=$m.MakeGenericMethod([Windows.Security.Credentials.UI.UserConsentVerificationResult]).Invoke($null,@([Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync('LiteBrowser: confirm it is you to open saved passwords')));"
+          "$t.Wait(-1)|Out-Null;Write-Output ('RESULT='+$t.Result)")
+
+    def run(self):
+        def work():
+            try:
+                r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", self.PS],
+                                   capture_output=True, text=True, timeout=180, creationflags=0x08000000)
+                m = re.search(r"RESULT=(\w+)", r.stdout or "")
+                self.result.emit(m.group(1) if m else "Unavailable")
+            except Exception:
+                self.result.emit("Unavailable")
+        threading.Thread(target=work, daemon=True).start()
+
+
 class EngineCheck(QObject):
     """Is a newer PyQt6-WebEngine (= newer Chromium with security fixes) on PyPI?"""
     result = pyqtSignal(str, str)          # installed, latest ("" if unknown)
@@ -986,7 +1247,9 @@ class SelfUpdater(QObject):
         def work():
             from urllib.request import Request, urlopen
             try:
-                data = urlopen(Request(url, headers={"User-Agent": "LiteBrowser"}), timeout=25).read()
+                if not url.lower().startswith("https://"):
+                    raise ValueError("the update link must start with https://")
+                data = urlopen(Request(url, headers={"User-Agent": "LiteBrowser"}), timeout=25).read(8_000_000)
                 text = data.decode("utf-8")
                 new = _ver(text)
                 if not new:
@@ -1403,6 +1666,69 @@ class Page(QWebEnginePage):
     def __init__(self, profile, browser):
         super().__init__(profile, browser)
         self.browser = browser
+        self._upgrade = None                     # http address we switched to https (to explain it if https fails)
+        self.loadFinished.connect(self._after_load)
+
+    def _show_warning(self, title, why, url, kind):
+        html = warning_html(title, why, url, kind)
+        QTimer.singleShot(0, lambda: self.setHtml(html, QUrl("about:blank")))
+
+    def _after_load(self, ok):
+        up = self._upgrade
+        if not up:
+            return
+        if ok:
+            self._upgrade = None
+            return
+        try:
+            rq = self.requestedUrl()
+            if rq.scheme() == "https" and rq.host() == QUrl(up).host():
+                self._upgrade = None
+                self._show_warning("This site can't be reached securely",
+                                   "The site does not offer a safe (https) connection, or its certificate is not valid. "
+                                   "Anything you type there could be read by others on the network.", up, "http")
+        except Exception:
+            self._upgrade = None
+
+    def acceptNavigationRequest(self, url, nav_type, is_main):
+        try:
+            sc = url.scheme()
+            if sc in ("lbgo", "lbhttp", "lbback"):
+                from urllib.parse import unquote
+                target = unquote(url.toString()[len(sc) + 1:])
+                g = self.browser.guard
+                if sc == "lbback":
+                    if self.history().canGoBack():
+                        QTimer.singleShot(0, self.history().back)
+                    else:
+                        QTimer.singleShot(0, lambda: self.setUrl(QUrl("about:blank")))
+                elif target.startswith(("http://", "https://")):
+                    host = (QUrl(target).host() or "").lower()
+                    (g.allowed if sc == "lbgo" else g.http_ok).add(host)
+                    QTimer.singleShot(0, lambda: self.setUrl(QUrl(target)))
+                return False
+            if not is_main:
+                return True
+            if sc in ("file", "data") and nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+                if self.url().scheme() in ("http", "https"):
+                    return False                 # a web page may not send you to files on your PC or to data: pages
+            if sc in ("http", "https"):
+                g = self.browser.guard
+                v = g.verdict(url.toString())
+                if v:
+                    self._show_warning(v[1], v[2], url.toString(), v[0])
+                    return False
+                if sc == "http" and g.should_upgrade(url.host()):
+                    sec = QUrl(url)
+                    sec.setScheme("https")
+                    if sec.port() == 80:
+                        sec.setPort(-1)
+                    self._upgrade = url.toString()
+                    QTimer.singleShot(0, lambda: self.setUrl(sec))
+                    return False
+        except Exception:
+            pass
+        return True
 
     def javaScriptConsoleMessage(self, level, message, line, source):
         if message.startswith(PW_MARK):  # our own login watcher (isolated world); everything else a site logs is ignored
@@ -2595,6 +2921,10 @@ class PasswordsWindow(QFrame):
         self.b = browser
         self._drag = None
         self._shown = set()
+        self._idle = QTimer(self)                      # the window locks itself after 3 minutes
+        self._idle.setSingleShot(True)
+        self._idle.timeout.connect(self.close)
+        self._idle.start(180000)
         self.resize(640, 700)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(24, 20, 24, 22)
@@ -2683,6 +3013,9 @@ class PasswordsWindow(QFrame):
                                 "The CSV file will contain all your passwords as plain text. Anyone who gets the file can read them. Continue?"
                                 ) != QMessageBox.StandardButton.Yes:
             return
+        self.b.verify_user(self._export_save)
+
+    def _export_save(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export passwords", "litebrowser-passwords.csv", "CSV files (*.csv)")
         if path:
             try:
@@ -3559,6 +3892,13 @@ class Browser(QMainWindow):
         self.engine = EngineCheck()
         self.engine.result.connect(self.on_engine_checked)
         self._engine_new = ""
+        prefs0 = load_json(PREFS_FILE, {})
+        self.guard = Guard()
+        self.guard.https_first = prefs0.get("https_first", True)
+        self.osv = OsVerify()
+        self.osv.result.connect(self._on_verified)
+        self._verified_at = 0.0
+        self._verify_then = None
         self.pw = PasswordStore()
         self.pw_on = load_json(PREFS_FILE, {}).get("pw_offer", True)
         self._pw_pending = None
@@ -3569,6 +3909,12 @@ class Browser(QMainWindow):
         s.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
 
         self.adblock = AdBlock()
+        self.adblock.guard = self.guard
+        for _n in ("AllowRunningInsecureContent", "LocalContentCanAccessRemoteUrls", "AllowGeolocationOnInsecureOrigins"):
+            try:
+                s.setAttribute(getattr(QWebEngineSettings.WebAttribute, _n), False)
+            except Exception:
+                pass
         self.adblock.allow = set(load_json(PREFS_FILE, {}).get("adblock_allow", []))
         self.profile.setUrlRequestInterceptor(self.adblock)
         self.cosmetic = QWebEngineScript()
@@ -3920,6 +4266,8 @@ class Browser(QMainWindow):
         QTimer.singleShot(3500, self.ensure_shortcut)
         QTimer.singleShot(9000, self.auto_check_updates)
         QTimer.singleShot(20000, self.auto_engine_check)
+        QTimer.singleShot(12000, self.guard.refresh)
+        QTimer.singleShot(8000, self.auto_self_check)
         gt = QTimer(self)
         gt.timeout.connect(self.auto_sync)
         gt.start(30 * 60 * 1000)
@@ -4576,7 +4924,17 @@ class Browser(QMainWindow):
 
     def on_download(self, req):
         d = self.download_dir()
-        target = d / (req.downloadFileName() or "download")
+        fname = safe_filename(req.downloadFileName())
+        ext = Path(fname).suffix.lower()
+        if ext in DANGEROUS_EXT:
+            src = req.url().host() or "this site"
+            if QMessageBox.warning(self, "Download a program?", f"{fname}\nfrom {src}\n\nThis kind of file can run code on your PC and is a common way to spread viruses. "
+                                   "Only keep it if you trust the site and expected this file.\n\nDownload it?",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                   QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                req.cancel()
+                return
+        target = d / fname
         stem, suf, n = target.stem, target.suffix, 1
         while target.exists():
             target = d / f"{stem} ({n}){suf}"
@@ -4603,6 +4961,7 @@ class Browser(QMainWindow):
         S = QWebEngineDownloadRequest.DownloadState
         if st == S.DownloadCompleted:
             rec["state"], rec["pct"] = "Done", 100
+            mark_of_the_web(rec["path"])
             self.toast(f"Downloaded {rec['name']}")
         elif st == S.DownloadCancelled:
             rec["state"] = "Cancelled"
@@ -4612,6 +4971,11 @@ class Browser(QMainWindow):
 
     def open_download(self, rec):
         if rec["state"] == "Done":
+            if Path(rec["path"]).suffix.lower() in DANGEROUS_EXT and QMessageBox.question(
+                    self, "Run this file?", f"{rec['name']} is a program or script. Run it only if you trust where it came from.\n\nOpen it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
             QDesktopServices.openUrl(QUrl.fromLocalFile(rec["path"]))
 
     # --- site permissions (camera, microphone, location, ...) ---------------------------------
@@ -4996,11 +5360,88 @@ class Browser(QMainWindow):
         except RuntimeError:
             pass
 
+    def toggle_https_first(self):
+        self.guard.https_first = not self.guard.https_first
+        prefs = load_json(PREFS_FILE, {})
+        prefs["https_first"] = self.guard.https_first
+        save_json(PREFS_FILE, prefs)
+        self.toast("HTTPS-first " + ("on" if self.guard.https_first else "off"))
+
+    def self_check(self):
+        """Quick health check of the safety features on THIS PC. Returns [(name, ok, detail)]."""
+        out = []
+
+        def add(name, ok, detail=""):
+            out.append((name, bool(ok), detail))
+        try:
+            add("Encryption of passwords/cookies (Windows account)", _unseal(_seal("lb-test")) == "lb-test",
+                "DPAPI" if sys.platform == "win32" else "not Windows: stored without account encryption")
+        except Exception as ex:
+            add("Encryption of passwords/cookies (Windows account)", False, str(ex)[:60])
+        try:
+            DATA.mkdir(parents=True, exist_ok=True)
+            t = DATA / ".write_test"
+            t.write_text("x")
+            t.unlink()
+            add("Data folder writable", True, str(DATA))
+        except Exception as ex:
+            add("Data folder writable", False, str(ex)[:60])
+        g = self.guard
+        add("Known-bad address list", g.loaded, f"{g.count():,} entries" if g.loaded else "not downloaded yet (needs internet, retries on each start)")
+        probe = Guard.__new__(Guard)
+        probe.mal_hosts, probe.ph_hosts, probe.ph_urls, probe.allowed = set(), set(), set(), set()
+        add("Look-alike detection works",
+            probe.verdict("https://paypal.com.evil.tk/login") is not None and probe.verdict("https://www.paypal.com/") is None
+            and probe.verdict("https://google.com/") is None)
+        add("HTTPS-first", g.https_first, "on" if g.https_first else "turned off in the menu")
+        add("Windows Hello gate for passwords", sys.platform == "win32", "asks before showing passwords" if sys.platform == "win32" else "Windows only")
+        add("Cookies saved", self.cookies.count() > 0, f"{self.cookies.count():,} cookies kept")
+        add("Notifications tray", QSystemTrayIcon.isSystemTrayAvailable())
+        add("Update link is https", (not SelfUpdater.url()) or SelfUpdater.url().lower().startswith("https://"),
+            SelfUpdater.url() or "no auto-update link set")
+        add("Engine version", self.chromium_version() != "?", "Chromium " + self.chromium_version())
+        return out
+
+    def auto_self_check(self):
+        try:
+            bad = [n for n, ok, _ in self.self_check() if not ok and n != "Cookies saved"]
+            if bad:
+                self.toast(f"Self-check: {len(bad)} safety item(s) need attention - open the menu > Phishing & malware shield")
+        except Exception:
+            pass
+
+    def show_self_check(self):
+        rows = self.self_check()
+        txt = "\n".join(("OK    " if ok else "FIX   ") + n + (f"  -  {d}" if d else "") for n, ok, d in rows)
+        QMessageBox.information(self, "Safety self-check", txt)
+
     def toggle_pw_offer(self):
         prefs = load_json(PREFS_FILE, {})
         prefs["pw_offer"] = not self.pw_on
         save_json(PREFS_FILE, prefs)
         self.toast("Password saving " + ("turned on" if not self.pw_on else "turned off") + " - restart to apply")
+
+    def verify_user(self, then):
+        """Run `then` after Windows Hello / PIN confirms it is you (remembered for 2 minutes)."""
+        if sys.platform != "win32" or time.time() - self._verified_at < 120:
+            then()
+            return
+        self._verify_then = then
+        self.toast("Confirm it is you with Windows Hello / your PIN")
+        self.osv.run()
+
+    def _on_verified(self, res):
+        then, self._verify_then = self._verify_then, None
+        if then is None:
+            return
+        if res == "Verified":
+            self._verified_at = time.time()
+            then()
+        elif res in ("DeviceNotPresent", "NotConfiguredForUser", "DisabledByPolicy", "Unavailable"):
+            self.toast("Windows Hello is not set up, so your passwords are open to anyone using this PC. Set it up in Windows Settings > Accounts > Sign-in options.")
+            then()
+        else:
+            self.toast("Not confirmed - passwords stay locked")
 
     def show_passwords(self):
         try:
@@ -5009,6 +5450,9 @@ class Browser(QMainWindow):
                 return
         except RuntimeError:
             self._pwin = None
+        self.verify_user(self._open_passwords)
+
+    def _open_passwords(self):
         w = PasswordsWindow(self)
         w.destroyed.connect(lambda *_, x=w: setattr(self, "_pwin", None) if self._pwin is x else None)
         g = self.geometry()
@@ -5145,6 +5589,10 @@ class Browser(QMainWindow):
         m.addAction(rt)
         m.addAction("History", self.show_history)
         m.addAction(f"Passwords  ({len(self.pw.items)} saved)", self.show_passwords)
+        hf = QAction("HTTPS-first (upgrade http sites)", m, checkable=True, checked=self.guard.https_first)
+        hf.triggered.connect(self.toggle_https_first)
+        m.addAction(hf)
+        m.addAction(f"Phishing & malware shield  ({self.guard.count():,} known-bad addresses)  - run self-check", self.show_self_check)
         a = QAction("Offer to save & fill passwords", m, checkable=True, checked=self.pw_on)
         a.triggered.connect(self.toggle_pw_offer)
         m.addAction(a)
