@@ -43,9 +43,9 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = " ".join([
 ])
 
 from PyQt6.QtCore import (QEasingCurve, QEvent, QRect, QStandardPaths, QVariantAnimation, QObject, QParallelAnimationGroup, QPoint, QPointF, QPropertyAnimation,
-                          QRectF, QSize, Qt, QTimer, QUrl, pyqtProperty, pyqtSignal)
+                          QRectF, QSize, Qt, QTimer, QUrl, QDateTime, pyqtProperty, pyqtSignal)
 from PyQt6.QtGui import QBitmap, QBrush, QCursor, QLinearGradient, QRadialGradient
-from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket, QNetworkCookie
 from PyQt6.QtGui import (QAction, QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QKeySequence,
                          QPainter, QPainterPath, QPalette, QPen, QPixmap, QPolygonF, QShortcut)
 from PyQt6.QtWebEngineCore import (QWebEngineDownloadRequest, QWebEnginePage, QWebEngineProfile, QWebEngineScript,
@@ -64,7 +64,7 @@ DATA = Path(os.environ.get("LITEBROWSER_DATA") or (Path.home() / ".litebrowser")
 _mark("imports_done")
 
 # ---------------------------------------------------------------- self-update (single file)
-APP_VERSION = "4.0.3"          # bump this whenever you publish a new litebrowser4.py
+APP_VERSION = "4.0.4"          # bump this whenever you publish a new litebrowser4.py
 UPDATE_URL = ""                # direct link to the raw litebrowser4.py (e.g. a GitHub "Raw" link); or set it in the menu
 UPDATE_FILE = DATA / "litebrowser_update.py"   # used by the .exe build, which can't overwrite itself
 
@@ -95,6 +95,7 @@ if getattr(sys, "frozen", False) and __name__ == "__main__" and UPDATE_FILE.exis
 EXT_DIR = DATA / "extensions"
 LIST_FILE = DATA / "blocklist.txt"
 STATS_FILE = DATA / "stats.json"
+COOKIE_FILE = DATA / "cookies.json"       # our own copy of every cookie (see CookieJar)
 BM_FILE = DATA / "bookmarks.json"
 SESSION_FILE = DATA / "session.json"
 HISTORY_DB = DATA / "history.db"
@@ -588,6 +589,164 @@ class AdBlock(QWebEngineUrlRequestInterceptor):
             self.s_count += 1
             self.s_bytes += b
             self.s_ms += ms
+
+
+def _dpapi(data, protect):
+    """Windows DPAPI: encrypt/decrypt bytes so that only the current Windows user can read them."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    out = BLOB()
+    f = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    f.argtypes = [ctypes.POINTER(BLOB), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                  wintypes.DWORD, ctypes.POINTER(BLOB)]
+    f.restype = wintypes.BOOL
+    if not f(ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out)):
+        raise OSError("DPAPI failed")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
+class CookieJar(QObject):
+    """Our own, independent copy of every cookie, so sign-ins survive closing the browser.
+
+    Chromium keeps cookies in its own database and only writes it now and then (and drops cookies that have no expiry
+    date when it closes). That is how people end up signed out. This jar records every cookie the moment it is set or
+    removed, gives expiry-less 'session' cookies a 30-day life, saves to cookies.json (atomically, a couple of seconds
+    after any change and again on exit) and puts everything back into the engine on the next start."""
+    SESSION_DAYS = 30
+
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.jar = {}                  # (domain, path, name) -> (value, raw "Set-Cookie" text)
+        self._restoring = False
+        self._dirty = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(2000)
+        self._timer.timeout.connect(self.save)
+        self._load_file()
+        store.cookieAdded.connect(self.on_added)
+        store.cookieRemoved.connect(self.on_removed)
+
+    @staticmethod
+    def _key(c):
+        return (str(c.domain()).lower(), str(c.path()), bytes(c.name()).decode("utf-8", "ignore"))
+
+    def _load_file(self):
+        data = {}
+        try:
+            txt = COOKIE_FILE.read_text(encoding="utf-8")
+            if txt.startswith("DPAPI1:"):                    # encrypted with your Windows account (like Chrome does)
+                import base64
+                txt = _dpapi(base64.b64decode(txt[7:]), False).decode("utf-8")
+            data = json.loads(txt)
+        except Exception:
+            data = {}
+        now = time.time()
+        for rec in data.get("cookies", []) if isinstance(data, dict) else []:
+            try:
+                if rec["exp"] > now:
+                    self.jar[(rec["d"], rec["p"], rec["n"])] = (rec["v"], rec["raw"], rec["exp"])
+            except Exception:
+                continue
+
+    def restore(self):
+        """Hand every saved cookie back to the engine (call before the first page loads)."""
+        self._restoring = True
+        n = 0
+        try:
+            for (d, p, name), (v, raw, exp) in list(self.jar.items()):
+                try:
+                    cs = QNetworkCookie.parseCookies(raw.encode("utf-8"))
+                    if not cs:
+                        continue
+                    c = cs[0]
+                    c.setExpirationDate(QDateTime.fromSecsSinceEpoch(int(exp)))
+                    host = d.lstrip(".")
+                    self.store.setCookie(c, QUrl(("https://" if c.isSecure() else "http://") + host + (p or "/")))
+                    n += 1
+                except Exception:
+                    continue
+        finally:
+            self._restoring = False
+        try:
+            self.store.loadAllCookies()        # also report the cookies Chromium kept itself, so the jar holds everything
+        except Exception:
+            pass
+        return n
+
+    def on_added(self, cookie):
+        try:
+            c = QNetworkCookie(cookie)
+            exp = time.time() + self.SESSION_DAYS * 86400
+            if not c.isSessionCookie():
+                exp = c.expirationDate().toSecsSinceEpoch()
+                if exp <= time.time():                      # the site is deleting it
+                    self.jar.pop(self._key(c), None)
+                    self._touch()
+                    return
+            else:
+                c.setExpirationDate(QDateTime.fromSecsSinceEpoch(int(exp)))
+            raw = bytes(c.toRawForm()).decode("utf-8", "ignore")
+            self.jar[self._key(c)] = (bytes(c.value()).decode("utf-8", "ignore"), raw, exp)
+            if not self._restoring:
+                self._touch()
+        except Exception:
+            pass
+
+    def on_removed(self, cookie):
+        try:
+            k = self._key(cookie)
+            cur = self.jar.get(k)
+            if cur is not None and cur[0] == bytes(cookie.value()).decode("utf-8", "ignore"):   # (an overwrite reports the OLD value)
+                del self.jar[k]
+                self._touch()
+        except Exception:
+            pass
+
+    def _touch(self):
+        self._dirty = True
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def save(self):
+        if not self._dirty:
+            return
+        self._dirty = False
+        try:
+            now = time.time()
+            rows = [{"d": d, "p": p, "n": n, "v": v, "raw": raw, "exp": exp}
+                    for (d, p, n), (v, raw, exp) in self.jar.items() if exp > now]
+            DATA.mkdir(parents=True, exist_ok=True)
+            tmp = COOKIE_FILE.with_suffix(".tmp")
+            txt = json.dumps({"cookies": rows})
+            if sys.platform == "win32":                      # only your Windows account can read the saved sign-ins
+                try:
+                    import base64
+                    txt = "DPAPI1:" + base64.b64encode(_dpapi(txt.encode("utf-8"), True)).decode("ascii")
+                except Exception:
+                    pass
+            tmp.write_text(txt, encoding="utf-8")
+            os.replace(tmp, COOKIE_FILE)
+        except Exception:
+            pass
+
+    def clear(self):
+        self.jar.clear()
+        self._dirty = True
+        self.save()
+
+    def count(self):
+        return len(self.jar)
 
 
 class SelfUpdater(QObject):
@@ -2973,6 +3132,8 @@ class Browser(QMainWindow):
         except Exception:
             pass
         self.profile.downloadRequested.connect(self.on_download)
+        self.cookies = CookieJar(self.profile.cookieStore(), self)      # our own copy of all cookies (keeps you signed in)
+        self.cookies.restore()
         s = self.profile.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
         s.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False)
@@ -4205,6 +4366,10 @@ class Browser(QMainWindow):
     def shutdown_web(self):
         """Tear the web engine down in the right order so Chromium writes cookies/logins to disk before we exit."""
         try:
+            self.cookies.save()
+        except Exception:
+            pass
+        try:
             for n in range(self.tabbar.count()):
                 d = self.tabbar.tabData(n)
                 if isinstance(d, TabStub):
@@ -4320,6 +4485,7 @@ class Browser(QMainWindow):
         rt.triggered.connect(self.toggle_restore)
         m.addAction(rt)
         m.addAction("History", self.show_history)
+        m.addAction(f"Saved sign-ins: {self.cookies.count():,} cookies kept").setEnabled(False)
         dm = GlassMenu("Downloads", m)
         m.addMenu(dm)
         if not self.downloads:
@@ -5151,6 +5317,7 @@ class Browser(QMainWindow):
     def clear_data(self):
         self.profile.clearHttpCache()
         self.profile.cookieStore().deleteAllCookies()
+        self.cookies.clear()
         self.toast("Cache and cookies cleared")
 
 
@@ -5438,6 +5605,7 @@ if __name__ == "__main__":
         QLocalServer.removeServer(SERVER_NAME)
         server.listen(SERVER_NAME)
         server.newConnection.connect(lambda: on_instance_connection(server, win))
+    app.aboutToQuit.connect(win.cookies.save)
     app.aboutToQuit.connect(win.adblock.save)
     app.aboutToQuit.connect(win.save_session)
     app.aboutToQuit.connect(win.history.flush)
